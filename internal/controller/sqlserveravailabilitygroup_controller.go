@@ -320,30 +320,42 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileReadOnlyListenerService(
 // so that the listener and read-only Services route to the correct pods.
 // Label values:
 //   - "primary"            — the pod currently holding the PRIMARY role
-//   - "readable-secondary" — a SECONDARY pod whose spec marks it as readableSecondary: true
-//   - "secondary"          — all other secondary pods
+//   - "readable-secondary" — a non-primary pod whose spec marks it as readableSecondary: true
+//   - "secondary"          — all other non-primary pods
+//
+// Primary detection uses the live SQL query result (replicaRoles map) first, then falls back
+// to ag.Status.PrimaryReplica so that secondary pod labeling still works even when the DMV
+// query returns an empty result on a secondary (e.g. when synchronization_health is NOT_HEALTHY).
 func (r *SQLServerAvailabilityGroupReconciler) reconcilePodLabels(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup, replicaRoles map[string]string) error {
 	log := logf.FromContext(ctx)
+
+	// Determine primary pod: prefer live SQL query result, fall back to status field.
+	primaryPod := ag.Status.PrimaryReplica
+	for podName, role := range replicaRoles {
+		if role == "PRIMARY" {
+			primaryPod = podName
+			break
+		}
+	}
+
 	// Build a lookup from pod name → readableSecondary flag from the spec.
 	readableByPod := make(map[string]bool, len(ag.Spec.Replicas))
-	for i, rep := range ag.Spec.Replicas {
+	for i := range ag.Spec.Replicas {
 		podName := fmt.Sprintf("%s-%d", ag.Name, i)
-		_ = rep // silence unused warning; use index-based pod name
 		readableByPod[podName] = ag.Spec.Replicas[i].ReadableSecondary
 	}
 
 	for i := range ag.Spec.Replicas {
 		podName := fmt.Sprintf("%s-%d", ag.Name, i)
-		role := replicaRoles[podName]
 
-		desiredLabel := "secondary"
-		switch role {
-		case "PRIMARY":
+		// Assign label based on primary identity (SQL-confirmed or status-derived) and spec.
+		var desiredLabel string
+		if podName == primaryPod {
 			desiredLabel = "primary"
-		case "SECONDARY":
-			if readableByPod[podName] {
-				desiredLabel = "readable-secondary"
-			}
+		} else if readableByPod[podName] {
+			desiredLabel = "readable-secondary"
+		} else {
+			desiredLabel = "secondary"
 		}
 
 		pod := &corev1.Pod{}
