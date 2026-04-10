@@ -96,14 +96,16 @@ var _ = Describe("SQLServerInstance", Ordered, Label("instance"), func() {
 		Expect(out).To(ContainSubstring("hello"))
 	})
 
-	It("should report Ready in the CR status", func() {
-		By("checking SQLServerInstance status for Ready condition")
+	It("should report Available in the CR status", func() {
+		By("checking SQLServerInstance status for Available condition")
+		// The instance controller sets condition type "Available" (not "Ready")
+		// when the StatefulSet has at least one ready replica.
 		Eventually(func(g Gomega) {
 			cmd := exec.Command("kubectl", "get", "sqli", "mssql-e2e", "-n", agNamespace,
-				"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}")
 			out, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(out).To(Equal("True"), "SQLServerInstance not Ready")
+			g.Expect(out).To(Equal("True"), "SQLServerInstance not Available")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 	})
 })
