@@ -1,0 +1,29 @@
+# SQLServerInstance sample — standalone SQL Server 2022 Developer Edition
+# Prerequisites:
+#   kubectl create secret generic mssql-secret \
+#     --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
+apiVersion: sql.mssql.microsoft.com/v1alpha1
+kind: SQLServerInstance
+metadata:
+  name: mssql-standalone
+  namespace: default
+spec:
+  image: mcr.microsoft.com/mssql/server:2022-latest
+  edition: Developer
+  acceptEula: "Y"
+  saPasswordSecretRef:
+    name: mssql-secret
+    key: SA_PASSWORD
+  port: 1433
+  storage:
+    dataVolumeSize: "10Gi"
+  mssqlConf:
+    "memory.memorylimitmb": "2048"
+    "sqlagent.enabled": "false"
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2"

@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- sql_v1alpha1_sqlserverinstance.yaml
+- sql_v1alpha1_sqlserveravailabilitygroup.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

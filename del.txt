@@ -1,0 +1,1 @@
+pod "mssql-standalone-0" deleted

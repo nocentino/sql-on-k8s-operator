@@ -1,0 +1,53 @@
+# SQLServerAvailabilityGroup sample — 3-replica AG with synchronous commit
+# Prerequisites:
+#   kubectl create secret generic mssql-ag-secret \
+#     --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
+apiVersion: sql.mssql.microsoft.com/v1alpha1
+kind: SQLServerAvailabilityGroup
+metadata:
+  name: mssql-ag
+  namespace: default
+spec:
+  agName: "AG1"
+  image: mcr.microsoft.com/mssql/server:2022-latest
+  edition: Developer
+  acceptEula: "Y"
+  saPasswordSecretRef:
+    name: mssql-ag-secret
+    key: SA_PASSWORD
+  endpointPort: 5022
+  replicas:
+    - name: primary
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+    - name: secondary-1
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+    - name: secondary-2
+      availabilityMode: AsynchronousCommit
+      failoverMode: Manual
+      readableSecondary: true
+  storage:
+    dataVolumeSize: "20Gi"
+  mssqlConf:
+    "memory.memorylimitmb": "2048"
+  # Read-write listener: always points at the current PRIMARY replica.
+  # The service selector targets the pod labelled sql.mssql.microsoft.com/ag-role=primary.
+  listener:
+    name: mssql-ag-listener
+    port: 1433
+    serviceType: ClusterIP
+  # Read-only listener: targets readable SECONDARY replicas with ClientIP session affinity.
+  # Connections are pinned to the same replica for the duration of the session (5 min timeout).
+  readOnlyListener:
+    name: mssql-ag-listener-ro
+    port: 1433
+    serviceType: ClusterIP
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2"

@@ -1,0 +1,8 @@
+deployment.apps/sql-on-k8s-operator-controller-manager restarted
+Waiting for deployment "sql-on-k8s-operator-controller-manager" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "sql-on-k8s-operator-controller-manager" rollout to finish: 1 old replicas are pending termination...
+deployment "sql-on-k8s-operator-controller-manager" successfully rolled out
+ROLLOUT=0
+secret/mssql-ag-secret created
+sqlserveravailabilitygroup.sql.mssql.microsoft.com/mssql-ag created
+AG_APPLY=0

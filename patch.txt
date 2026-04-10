@@ -1,0 +1,1 @@
+configmap/mssql-standalone-mssql-conf patched
