@@ -38,6 +38,26 @@ var _ = Describe("AG Database Membership", Ordered, Label("ag", "databases"), fu
 		waitForAGBootstrap("mssql-ag", 10*time.Minute)
 		primary = getAGPrimary("mssql-ag")
 		Expect(primary).NotTo(BeEmpty())
+
+		// Idempotent cleanup: remove agdb from the AG and drop it on all replicas so
+		// the test starts clean even if a previous run failed mid-way.
+		By("cleaning up any leftover agdb from previous runs")
+		// Remove from AG cluster-wide (best-effort; fails silently if not in AG).
+		_, _ = execSQL(primary,
+			"IF EXISTS (SELECT 1 FROM sys.availability_databases_cluster WHERE database_name = 'agdb') "+
+				"ALTER AVAILABILITY GROUP AG1 REMOVE DATABASE agdb;")
+		// Set HADR OFF on secondaries (handles databases stuck in RESTORING state).
+		for _, pod := range []string{"mssql-ag-1", "mssql-ag-2"} {
+			if pod != primary {
+				_, _ = execSQL(pod,
+					"IF EXISTS (SELECT 1 FROM sys.databases WHERE name = 'agdb') "+
+						"ALTER DATABASE agdb SET HADR OFF;")
+			}
+		}
+		// Drop database on all pods.
+		for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+			_, _ = execSQL(pod, "DROP DATABASE IF EXISTS agdb;")
+		}
 	})
 
 	Context("Add database to AG", func() {
@@ -61,18 +81,31 @@ var _ = Describe("AG Database Membership", Ordered, Label("ag", "databases"), fu
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			By("taking full backup and adding " + dbName + " to AG1")
+			By("taking full backup and adding " + dbName + " to AG1 – automatic seeding propagates to secondaries")
+			// SQL Server requires at least one full backup before a database can join an AG.
+			// With SEEDING_MODE = AUTOMATIC the primary VDI-seeds the database directly to every
+			// connected secondary; no manual backup/restore is needed on secondaries.
 			_, err = execSQL(primary, fmt.Sprintf(
-				"BACKUP DATABASE %s TO DISK = '/var/opt/mssql/data/%s.bak' WITH INIT, FORMAT;"+
+				"BACKUP DATABASE %s TO DISK = '/var/opt/mssql/data/%s.bak' WITH INIT, FORMAT; "+
 					"ALTER AVAILABILITY GROUP AG1 ADD DATABASE %s;", dbName, dbName, dbName))
 			Expect(err).NotTo(HaveOccurred())
 
-			By("restoring and joining " + dbName + " on each secondary")
+			By("waiting for " + dbName + " to be seeded on every secondary")
 			for _, pod := range []string{"mssql-ag-1", "mssql-ag-2"} {
-				_, err = execSQL(pod, fmt.Sprintf(
-					"RESTORE DATABASE %s FROM DISK = '/var/opt/mssql/data/%s.bak' WITH NORECOVERY, REPLACE;"+
-						"ALTER DATABASE %s SET HADR AVAILABILITY GROUP = AG1;", dbName, dbName, dbName))
-				Expect(err).NotTo(HaveOccurred())
+				if pod == primary {
+					continue
+				}
+				Eventually(func(g Gomega) {
+					out, err := execSQL(pod, fmt.Sprintf(
+						"SET NOCOUNT ON; SELECT synchronization_state_desc "+
+							"FROM sys.dm_hadr_database_replica_states "+
+							"WHERE DB_NAME(database_id) = '%s' AND is_local = 1", dbName))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(Or(
+						ContainSubstring("SYNCHRONIZING"),
+						ContainSubstring("SYNCHRONIZED"),
+					), "database %s not yet seeded on %s", dbName, pod)
+				}, 5*time.Minute, 10*time.Second).Should(Succeed())
 			}
 
 			By("verifying " + dbName + " is in AG on the primary")
@@ -161,6 +194,12 @@ var _ = Describe("AG Database Membership", Ordered, Label("ag", "databases"), fu
 				}
 			}
 			Expect(rowsAfter).To(Equal(rowsBefore), "Data loss on primary after removing from AG!")
+
+			// Final cleanup: drop agdb so the AG is back to clean state for subsequent runs.
+			By("dropping " + dbName + " from all replicas")
+			for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+				_, _ = execSQL(pod, "DROP DATABASE IF EXISTS agdb;")
+			}
 		})
 	})
 })

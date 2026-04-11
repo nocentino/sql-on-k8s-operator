@@ -97,10 +97,11 @@ END`
 // PodName must match @@SERVERNAME inside the SQL Server container (the short pod hostname).
 // EndpointFQDN is the DNS name used in the ENDPOINT_URL (headless-service FQDN).
 type AGReplicaInput struct {
-	PodName          string // e.g. mssql-ag-0
-	EndpointFQDN     string // e.g. mssql-ag-0.mssql-ag-headless.default.svc.cluster.local
-	AvailabilityMode string
-	FailoverMode     string
+	PodName            string // e.g. mssql-ag-0
+	EndpointFQDN       string // e.g. mssql-ag-0.mssql-ag-headless.default.svc.cluster.local
+	AvailabilityMode   string
+	FailoverMode       string
+	ReadableSecondary  bool // when true, sets SECONDARY_ROLE(ALLOW_CONNECTIONS = ALL)
 }
 
 // AGExistsSQL returns a query whose result is 1 if the named AG exists, 0 otherwise.
@@ -135,13 +136,18 @@ func CreateAGSQL(agName, clusterType string, replicas []AGReplicaInput, endpoint
 		if i == len(replicas)-1 {
 			sep = ""
 		}
+		secondaryRole := "SECONDARY_ROLE (ALLOW_CONNECTIONS = NO)"
+		if r.ReadableSecondary {
+			secondaryRole = "SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)"
+		}
 		replicaDefs += fmt.Sprintf(`
     N'%s' WITH (
         ENDPOINT_URL = N'TCP://%s:%d',
         FAILOVER_MODE = %s,
         AVAILABILITY_MODE = %s,
-        SEEDING_MODE = AUTOMATIC
-    )%s`, r.PodName, r.EndpointFQDN, endpointPort, failoverMode, availMode, sep)
+        SEEDING_MODE = AUTOMATIC,
+        %s
+    )%s`, r.PodName, r.EndpointFQDN, endpointPort, failoverMode, availMode, secondaryRole, sep)
 	}
 
 	return fmt.Sprintf(`CREATE AVAILABILITY GROUP [%s]

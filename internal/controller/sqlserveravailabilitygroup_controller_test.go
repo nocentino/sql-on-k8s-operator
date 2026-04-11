@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	sqlv1alpha1 "github.com/anocentino/sql-on-k8s-operator/api/v1alpha1"
+	"github.com/anocentino/sql-on-k8s-operator/internal/sqlutil"
 )
 
 // ── agscripts unit tests (pure functions, no envtest needed) ─────────────────
@@ -56,6 +57,25 @@ var _ = Describe("agscripts helpers", func() {
 		Expect(sql).To(ContainSubstring("pod-0.svc"))
 		Expect(sql).To(ContainSubstring("pod-1.svc"))
 		Expect(sql).To(ContainSubstring("AVAILABILITY GROUP"))
+	})
+
+	It("CreateAGSQL sets SECONDARY_ROLE ALLOW_CONNECTIONS = ALL when ReadableSecondary is true", func() {
+		replicas := []sqlutil.AGReplicaInput{
+			{PodName: "pod-0", EndpointFQDN: "pod-0.svc", AvailabilityMode: "SynchronousCommit", FailoverMode: "Manual", ReadableSecondary: false},
+			{PodName: "pod-1", EndpointFQDN: "pod-1.svc", AvailabilityMode: "SynchronousCommit", FailoverMode: "Manual", ReadableSecondary: true},
+		}
+		sql := sqlutil.CreateAGSQL("AG1", "NONE", replicas, 5022)
+		Expect(sql).To(ContainSubstring("ALLOW_CONNECTIONS = ALL"))
+		Expect(sql).To(ContainSubstring("ALLOW_CONNECTIONS = NO"))
+	})
+
+	It("CreateAGSQL sets SECONDARY_ROLE ALLOW_CONNECTIONS = NO when ReadableSecondary is false", func() {
+		replicas := []sqlutil.AGReplicaInput{
+			{PodName: "pod-0", EndpointFQDN: "pod-0.svc", AvailabilityMode: "SynchronousCommit", FailoverMode: "Manual", ReadableSecondary: false},
+		}
+		sql := sqlutil.CreateAGSQL("AG1", "NONE", replicas, 5022)
+		Expect(sql).To(ContainSubstring("ALLOW_CONNECTIONS = NO"))
+		Expect(sql).NotTo(ContainSubstring("ALLOW_CONNECTIONS = ALL"))
 	})
 
 	It("AG ConfigMap includes hadr.hadrenabled = 1", func() {

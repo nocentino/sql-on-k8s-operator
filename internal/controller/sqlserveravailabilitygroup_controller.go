@@ -492,10 +492,11 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	for i, rep := range replicas {
 		podName := fmt.Sprintf("%s-%d", ag.Name, i)
 		replicaInputs[i] = sqlutil.AGReplicaInput{
-			PodName:          podName,
-			EndpointFQDN:     fmt.Sprintf("%s.%s", podName, headlessDomain),
-			AvailabilityMode: string(rep.AvailabilityMode),
-			FailoverMode:     string(rep.FailoverMode),
+			PodName:           podName,
+			EndpointFQDN:      fmt.Sprintf("%s.%s", podName, headlessDomain),
+			AvailabilityMode:  string(rep.AvailabilityMode),
+			FailoverMode:      string(rep.FailoverMode),
+			ReadableSecondary: rep.ReadableSecondary,
 		}
 	}
 	// CREATE AVAILABILITY GROUP cannot be wrapped in BEGIN...END in SQL Server.
@@ -521,6 +522,12 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 		if _, createErr := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword, createSQL); createErr != nil {
 			return ctrl.Result{}, fmt.Errorf("could not create AG on primary: %w", createErr)
 		}
+		// Wait for the primary's HADR transport to initialise connection sessions
+		// before secondaries join.  Without this pause the JOIN races the primary's
+		// initial connection attempt and the replicas end up permanently DISCONNECTED
+		// (observed on Docker Desktop ARM64 with SQL Server 2022).
+		log.Info("Waiting for HADR transport to initialise before joining secondaries")
+		time.Sleep(10 * time.Second)
 	} else {
 		log.Info("Availability Group already exists, skipping CREATE", "ag", ag.Spec.AGName)
 	}
