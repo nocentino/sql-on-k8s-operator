@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -423,18 +424,18 @@ func buildMSSQLConf(conf map[string]string) string {
 		sections[section] = append(sections[section], fmt.Sprintf("%s = %s", key, v))
 	}
 
-	result := ""
+	var result strings.Builder
 	for _, line := range toplevel {
-		result += line + "\n"
+		result.WriteString(line + "\n")
 	}
 	for section, entries := range sections {
-		result += fmt.Sprintf("[%s]\n", section)
+		result.WriteString(fmt.Sprintf("[%s]\n", section))
 		for _, e := range entries {
-			result += e + "\n"
+			result.WriteString(e + "\n")
 		}
-		result += "\n"
+		result.WriteString("\n")
 	}
-	return result
+	return result.String()
 }
 
 // setCondition updates or appends a condition in a condition list.

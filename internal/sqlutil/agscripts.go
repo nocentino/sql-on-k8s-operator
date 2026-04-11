@@ -16,7 +16,13 @@ limitations under the License.
 
 package sqlutil
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// clusterTypeNone is the SQL Server cluster type for standalone AG (no Pacemaker/WSFC).
+const clusterTypeNone = "NONE"
 
 // CreateMasterKeySQL returns the T-SQL to create the database master key.
 func CreateMasterKeySQL(password string) string {
@@ -97,11 +103,11 @@ END`
 // PodName must match @@SERVERNAME inside the SQL Server container (the short pod hostname).
 // EndpointFQDN is the DNS name used in the ENDPOINT_URL (headless-service FQDN).
 type AGReplicaInput struct {
-	PodName            string // e.g. mssql-ag-0
-	EndpointFQDN       string // e.g. mssql-ag-0.mssql-ag-headless.default.svc.cluster.local
-	AvailabilityMode   string
-	FailoverMode       string
-	ReadableSecondary  bool // when true, sets SECONDARY_ROLE(ALLOW_CONNECTIONS = ALL)
+	PodName           string // e.g. mssql-ag-0
+	EndpointFQDN      string // e.g. mssql-ag-0.mssql-ag-headless.default.svc.cluster.local
+	AvailabilityMode  string
+	FailoverMode      string
+	ReadableSecondary bool // when true, sets SECONDARY_ROLE(ALLOW_CONNECTIONS = ALL)
 }
 
 // AGExistsSQL returns a query whose result is 1 if the named AG exists, 0 otherwise.
@@ -119,17 +125,17 @@ func AGExistsSQL(agName string) string {
 // callers must guard idempotency using AGExistsSQL before invoking this.
 func CreateAGSQL(agName, clusterType string, replicas []AGReplicaInput, endpointPort int32) string {
 	if clusterType == "" {
-		clusterType = "NONE"
+		clusterType = clusterTypeNone
 	}
 
-	replicaDefs := ""
+	var replicaDefs strings.Builder
 	for i, r := range replicas {
 		availMode := "SYNCHRONOUS_COMMIT"
 		if r.AvailabilityMode == "AsynchronousCommit" {
 			availMode = "ASYNCHRONOUS_COMMIT"
 		}
 		failoverMode := "MANUAL"
-		if r.FailoverMode == "Automatic" && clusterType != "NONE" {
+		if r.FailoverMode == "Automatic" && clusterType != clusterTypeNone {
 			failoverMode = "EXTERNAL"
 		}
 		sep := ","
@@ -140,25 +146,25 @@ func CreateAGSQL(agName, clusterType string, replicas []AGReplicaInput, endpoint
 		if r.ReadableSecondary {
 			secondaryRole = "SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)"
 		}
-		replicaDefs += fmt.Sprintf(`
+		replicaDefs.WriteString(fmt.Sprintf(`
     N'%s' WITH (
         ENDPOINT_URL = N'TCP://%s:%d',
         FAILOVER_MODE = %s,
         AVAILABILITY_MODE = %s,
         SEEDING_MODE = AUTOMATIC,
         %s
-    )%s`, r.PodName, r.EndpointFQDN, endpointPort, failoverMode, availMode, secondaryRole, sep)
+    )%s`, r.PodName, r.EndpointFQDN, endpointPort, failoverMode, availMode, secondaryRole, sep))
 	}
 
 	return fmt.Sprintf(`CREATE AVAILABILITY GROUP [%s]
     WITH (CLUSTER_TYPE = %s, DB_FAILOVER = OFF, DTC_SUPPORT = NONE)
-    FOR REPLICA ON%s;`, agName, clusterType, replicaDefs)
+    FOR REPLICA ON%s;`, agName, clusterType, replicaDefs.String())
 }
 
 // JoinAGSQL generates T-SQL for secondary replicas to join an existing AG.
 func JoinAGSQL(agName, clusterType string) string {
 	if clusterType == "" {
-		clusterType = "NONE"
+		clusterType = clusterTypeNone
 	}
 	return fmt.Sprintf(`
 IF EXISTS (SELECT * FROM sys.availability_groups WHERE name = '%s')

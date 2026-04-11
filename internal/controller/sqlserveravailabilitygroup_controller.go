@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -56,6 +57,8 @@ const (
 	// labelAGRole is set on every AG pod to reflect its current SQL Server AG role.
 	// Values: "primary", "readable-secondary", "secondary".
 	labelAGRole = "sql.mssql.microsoft.com/ag-role"
+	// agRolePrimary is the SQL Server AG role string returned by DMV queries for the primary replica.
+	agRolePrimary = "PRIMARY"
 )
 
 // +kubebuilder:rbac:groups=sql.mssql.microsoft.com,resources=sqlserveravailabilitygroups,verbs=get;list;watch;create;update;patch;delete
@@ -116,7 +119,7 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 			log.Error(err, "AG bootstrap failed; will retry")
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
-		if result.Requeue || result.RequeueAfter > 0 {
+		if result.RequeueAfter > 0 {
 			return result, nil
 		}
 		// Re-fetch after bootstrap so updateAGStatus starts with the latest
@@ -139,9 +142,7 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 func (r *SQLServerAvailabilityGroupReconciler) reconcileAGConfigMap(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
 	cmName := ag.Name + "-mssql-conf"
 	conf := make(map[string]string)
-	for k, v := range ag.Spec.MSSQLConf {
-		conf[k] = v
-	}
+	maps.Copy(conf, ag.Spec.MSSQLConf)
 	// Always enable HADR
 	conf["hadr.hadrenabled"] = "1"
 
@@ -332,7 +333,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcilePodLabels(ctx context.Co
 	// Determine primary pod: prefer live SQL query result, fall back to status field.
 	primaryPod := ag.Status.PrimaryReplica
 	for podName, role := range replicaRoles {
-		if role == "PRIMARY" {
+		if role == agRolePrimary {
 			primaryPod = podName
 			break
 		}
@@ -507,7 +508,7 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 		return ctrl.Result{}, fmt.Errorf("could not check AG existence: %w", err)
 	}
 	agAlreadyExists := false
-	for _, line := range strings.Split(existResult.Stdout, "\n") {
+	for line := range strings.SplitSeq(existResult.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		var n int
 		if _, scanErr := fmt.Sscanf(line, "%d", &n); scanErr == nil {
@@ -597,14 +598,14 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 		role, _ := exec.GetAGRole(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
 		syncState, _ := exec.GetAGSyncState(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
 		replicaRoles[podName] = role
-		if role == "PRIMARY" {
+		if role == agRolePrimary {
 			ag.Status.PrimaryReplica = podName
 		}
 
 		// Only stamp LastSeenPrimary when this pod is the active primary.
 		// Preserving the previous value avoids an always-dirty patch.
 		var lastSeenPrimary *metav1.Time
-		if role == "PRIMARY" {
+		if role == agRolePrimary {
 			now := metav1.Now()
 			lastSeenPrimary = &now
 		} else if prev, ok := existing[podName]; ok {

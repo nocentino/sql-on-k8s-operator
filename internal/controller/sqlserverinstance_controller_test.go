@@ -261,7 +261,7 @@ var _ = Describe("SQLServerInstance Controller", func() {
 	})
 
 	It("is idempotent: reconciling twice does not error", func() {
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred(), "reconcile %d should not error", i+1)
 		}

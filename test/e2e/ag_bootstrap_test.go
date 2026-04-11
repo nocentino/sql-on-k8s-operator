@@ -21,7 +21,6 @@ package e2e
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -32,30 +31,9 @@ import (
 	"github.com/anocentino/sql-on-k8s-operator/test/utils"
 )
 
+// AG Bootstrap verifies the state of the AG that was created by BeforeSuite in e2e_suite_test.go.
 var _ = Describe("AG Bootstrap", Ordered, Label("ag", "bootstrap"), func() {
 	AfterEach(func() { captureArtifacts("AG Bootstrap " + CurrentSpecReport().FullText()) })
-
-	BeforeAll(func() {
-		By("ensuring the AG secret exists")
-		_ = exec.Command("kubectl", "create", "secret", "generic", agSecretName,
-			"--from-literal=SA_PASSWORD="+sqlPassword,
-			"-n", agNamespace).Run()
-
-		By("applying the 3-replica AG CR")
-		f, err := os.CreateTemp("", "ag-cr-*.yaml")
-		Expect(err).NotTo(HaveOccurred())
-		_, _ = f.WriteString(agCRYAML)
-		f.Close()
-		cmd := exec.Command("kubectl", "apply", "-f", f.Name())
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-	})
-
-	AfterAll(func() {
-		By("deleting the AG CR and PVCs")
-		_ = exec.Command("kubectl", "delete", "sqlag", "mssql-ag", "-n", agNamespace, "--ignore-not-found=true").Run()
-		_ = exec.Command("kubectl", "delete", "pvc", "-l", "app=mssql-ag", "-n", agNamespace).Run()
-	})
 
 	It("should start all 3 replica pods", func() {
 		for i := 0; i < 3; i++ {

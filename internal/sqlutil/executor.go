@@ -116,7 +116,7 @@ WHERE ag.name = '%s' AND rs.is_local = 1;`, agName)
 		return "", err
 	}
 
-	for _, line := range strings.Split(res.Stdout, "\n") {
+	for line := range strings.SplitSeq(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "PRIMARY" || line == "SECONDARY" || line == "RESOLVING" {
 			return line, nil
@@ -185,7 +185,7 @@ WHERE ag.name = '%s' AND rs.is_local = 1;`, agName)
 		return "", err
 	}
 
-	for _, line := range strings.Split(res.Stdout, "\n") {
+	for line := range strings.SplitSeq(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" && line != "---" {
 			return line, nil

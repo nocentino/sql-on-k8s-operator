@@ -53,7 +53,7 @@ var _ = Describe("agscripts helpers", func() {
 	})
 
 	It("CreateAGSQL builds replica definitions for all replicas", func() {
-		sql := createAGHelper("AG1", []string{"pod-0.svc", "pod-1.svc"}, 5022)
+		sql := createAGHelper("AG1", []string{"pod-0.svc", "pod-1.svc"})
 		Expect(sql).To(ContainSubstring("pod-0.svc"))
 		Expect(sql).To(ContainSubstring("pod-1.svc"))
 		Expect(sql).To(ContainSubstring("AVAILABILITY GROUP"))
@@ -259,10 +259,11 @@ func createEndpointHelper(name, cert string, port int32) string {
 		name, port, cert)
 }
 
-func createAGHelper(agName string, fqdns []string, port int32) string {
-	s := "CREATE AVAILABILITY GROUP [" + agName + "] REPLICA ON"
+func createAGHelper(agName string, fqdns []string) string {
+	var s strings.Builder
+	s.WriteString("CREATE AVAILABILITY GROUP [" + agName + "] REPLICA ON")
 	for _, f := range fqdns {
-		s += " N'" + f + "' WITH (ENDPOINT_URL = N'TCP://" + f + ":5022'),"
+		s.WriteString(" N'" + f + "' WITH (ENDPOINT_URL = N'TCP://" + f + ":5022'),")
 	}
-	return s
+	return s.String()
 }
