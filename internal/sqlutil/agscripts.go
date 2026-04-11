@@ -119,6 +119,25 @@ func AGExistsSQL(agName string) string {
 		agName)
 }
 
+// SecondaryCountSQL returns a query that counts the number of replicas that are
+// both in SECONDARY role AND actively CONNECTED, as seen from the primary.
+//
+// Both conditions are required:
+//   - role_desc = 'SECONDARY'  — the JOIN was processed at the protocol level.
+//   - connected_state_desc = 'CONNECTED' — the HADR TCP transport session is
+//     established. This is critical: role_desc is set by the protocol JOIN message
+//     and can be SECONDARY even when the transport is DISCONNECTED (e.g. due to a
+//     DNS lookup failure on first connection attempt after CREATE AVAILABILITY GROUP).
+//     Requiring CONNECTED ensures the transport session is truly active before
+//     declaring bootstrap complete.
+func SecondaryCountSQL(agName string) string {
+	return fmt.Sprintf(
+		`SET NOCOUNT ON; SELECT COUNT(*) FROM sys.dm_hadr_availability_replica_states rs
+JOIN sys.availability_groups ag ON rs.group_id = ag.group_id
+WHERE ag.name = '%s' AND rs.role_desc = 'SECONDARY' AND rs.connected_state_desc = 'CONNECTED'`,
+		agName)
+}
+
 // CreateAGSQL generates the T-SQL CREATE AVAILABILITY GROUP statement for the primary.
 // REPLICA ON N'<PodName>' uses @@SERVERNAME (short hostname); ENDPOINT_URL uses the FQDN.
 // NOTE: CREATE AVAILABILITY GROUP cannot appear inside a BEGIN...END block in SQL Server;
@@ -162,18 +181,28 @@ func CreateAGSQL(agName, clusterType string, replicas []AGReplicaInput, endpoint
 }
 
 // JoinAGSQL generates T-SQL for secondary replicas to join an existing AG.
+//
+// Idempotency guard: skip the JOIN if the local replica already has an active
+// HADR state for this AG (i.e. the replica has previously joined successfully).
+// Note: sys.availability_groups on the SECONDARY is EMPTY before the first JOIN
+// because the AG only appears in the secondary's catalog after a successful JOIN.
+// Therefore the guard must query sys.dm_hadr_availability_replica_states (which
+// has a row with is_local=1 once joined) joined back to sys.availability_groups
+// so that the AG name can be matched — do NOT guard on sys.availability_groups
+// alone, as that will always be false on the first JOIN attempt and silently
+// prevent the JOIN from ever running.
 func JoinAGSQL(agName, clusterType string) string {
 	if clusterType == "" {
 		clusterType = clusterTypeNone
 	}
 	return fmt.Sprintf(`
-IF EXISTS (SELECT * FROM sys.availability_groups WHERE name = '%s')
-    AND NOT EXISTS (
-        SELECT * FROM sys.dm_hadr_availability_replica_states
-        WHERE is_local = 1 AND group_id = (SELECT group_id FROM sys.availability_groups WHERE name = '%s')
-    )
+IF NOT EXISTS (
+    SELECT 1 FROM sys.dm_hadr_availability_replica_states rs
+    JOIN sys.availability_groups ag ON rs.group_id = ag.group_id
+    WHERE rs.is_local = 1 AND ag.name = '%s'
+)
 BEGIN
     ALTER AVAILABILITY GROUP [%s] JOIN WITH (CLUSTER_TYPE = %s);
     ALTER AVAILABILITY GROUP [%s] GRANT CREATE ANY DATABASE;
-END`, agName, agName, agName, clusterType, agName)
+END`, agName, agName, clusterType, agName)
 }

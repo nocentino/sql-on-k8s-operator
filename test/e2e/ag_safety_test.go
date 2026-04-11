@@ -85,11 +85,41 @@ SELECT COUNT(*) FROM sys.dm_hadr_availability_replica_states`)
 				secondary = "mssql-ag-0"
 			}
 
-			By("inserting a sentinel row on primary")
+			By("creating testdb and adding it to the AG (automatic seeding to secondaries)")
 			_, err := execSQL(primary, createTestDB)
-			_ = err
+			Expect(err).NotTo(HaveOccurred())
 			_, err = execSQL(primary, createTestTable)
-			_ = err
+			Expect(err).NotTo(HaveOccurred())
+			// Remove testdb from AG if left over from a previous run
+			_, _ = execSQL(primary, "ALTER AVAILABILITY GROUP AG1 REMOVE DATABASE testdb;")
+			// Backup and add to AG — SEEDING_MODE = AUTOMATIC seeds secondaries automatically
+			_, err = execSQL(primary, addDBtoAGSQL)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Wait for ALL secondaries to complete VDI seeding before proceeding.
+			// If we only wait for one secondary and then drop testdb, the other secondary
+			// may have its VDI seeding interrupted mid-stream.  This leaves corrupted
+			// internal seeding state on that replica which makes the NEXT seeding attempt
+			// (from the scale or failover tests) take 5+ minutes even on unrelated pods.
+			By("waiting for testdb to be seeded on ALL secondaries")
+			for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+				if pod == primary {
+					continue
+				}
+				pod := pod // capture loop variable
+				Eventually(func(g Gomega) {
+					out, qErr := execSQL(pod,
+						"SET NOCOUNT ON; SELECT synchronization_state_desc "+
+							"FROM sys.dm_hadr_database_replica_states "+
+							"WHERE DB_NAME(database_id) = 'testdb' AND is_local = 1")
+					g.Expect(qErr).NotTo(HaveOccurred())
+					g.Expect(out).To(Or(ContainSubstring("SYNCHRONIZING"), ContainSubstring("SYNCHRONIZED")),
+						"testdb not yet seeded on %s: %s", pod, out)
+				}, 5*time.Minute, 10*time.Second).Should(Succeed(),
+					"testdb never seeded on %s", pod)
+			}
+
+			By("inserting a sentinel row on primary")
 			_, err = execSQL(primary, "INSERT INTO testdb.dbo.t (val) VALUES ('sentinel-safety-check')")
 			Expect(err).NotTo(HaveOccurred())
 
@@ -107,6 +137,12 @@ SELECT COUNT(*) FROM testdb.dbo.t WHERE val = 'sentinel-safety-check'`)
 				}
 				g.Expect(count).To(Equal(1), "Sentinel row not visible on secondary (stale read)")
 			}, 60*time.Second, 5*time.Second).Should(Succeed())
+
+			By("cleaning up: removing testdb from AG and dropping on all replicas")
+			_, _ = execSQL(primary, "ALTER AVAILABILITY GROUP AG1 REMOVE DATABASE testdb;")
+			for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+				_, _ = execSQL(pod, "DROP DATABASE IF EXISTS testdb;")
+			}
 		})
 	})
 

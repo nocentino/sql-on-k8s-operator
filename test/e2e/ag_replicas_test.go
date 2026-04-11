@@ -46,45 +46,119 @@ var _ = Describe("AG Replica Scale", Ordered, Label("ag", "scale"), func() {
 		// and performing assertions on the existing replicas becoming consistent.
 		It("should confirm all replicas are in the SECONDARY role and synchronized", func() {
 			By("verifying existing secondaries are SYNCHRONIZED before scale operation")
+			// BeforeSuite already confirmed CONNECTED state; this is a lightweight check
+			// that the replicas are still connected at the start of scale tests.
+			// For an empty AG synchronization_health_desc stays NOT_HEALTHY (nothing to
+			// synchronize), so connected_state_desc is the correct readiness signal.
 			for _, pod := range []string{"mssql-ag-1", "mssql-ag-2"} {
 				Eventually(func(g Gomega) {
 					out, err := execSQL(pod, `
 SET NOCOUNT ON;
-SELECT synchronization_state_desc
+SELECT connected_state_desc
 FROM sys.dm_hadr_availability_replica_states
 WHERE is_local = 1`)
 					g.Expect(err).NotTo(HaveOccurred(), "Failed to query %s", pod)
-					g.Expect(out).To(Or(
-						ContainSubstring("SYNCHRONIZED"),
-						ContainSubstring("SYNCHRONIZING"),
-					), "pod %s not synchronized: %s", pod, out)
+					g.Expect(out).To(ContainSubstring("CONNECTED"),
+						"pod %s HADR transport not connected: %s", pod, out)
 				}, 3*time.Minute, 5*time.Second).Should(Succeed())
 			}
 		})
 
 		It("should have consistent row counts across all replicas", func() {
 			primary := getAGPrimary("mssql-ag")
-			By("inserting 20 validation rows on primary " + primary)
+			By("ensuring clean testdb state: removing from AG and dropping on all replicas")
+			// Try REMOVE DATABASE on every pod because the current primary may have changed
+			// after a previous failover test (ordered containers share an AG lifecycle).
+			for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+				_, _ = execSQL(pod, "ALTER AVAILABILITY GROUP AG1 REMOVE DATABASE testdb;")
+			}
+			// Allow SQL Server to complete HADR session teardown before issuing the DROP.
+			// Without this pause, the DROP of a RESTORING secondary database can race with
+			// internal HADR cleanup and leave residual state that blocks the next VDI seed.
+			time.Sleep(5 * time.Second)
+			for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+				_, _ = execSQL(pod, "DROP DATABASE IF EXISTS testdb;")
+			}
+			// Wait for testdb to be completely absent from sys.databases on all pods
+			// before creating a fresh copy.  If a DROP fails silently (e.g. due to
+			// a lock held by the HADR redo thread), VDI seeding will never start.
+			for _, pod := range []string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"} {
+				pod := pod
+				Eventually(func(g Gomega) {
+					out, _ := execSQL(pod,
+						"SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name = 'testdb'")
+					var count int
+					for _, line := range strings.Split(out, "\n") {
+						line = strings.TrimSpace(line)
+						if _, scanErr := fmt.Sscanf(line, "%d", &count); scanErr == nil {
+							break
+						}
+					}
+					g.Expect(count).To(Equal(0), "testdb still present on %s", pod)
+				}, 2*time.Minute, 5*time.Second).Should(Succeed(),
+					"testdb never fully dropped on %s", pod)
+			}
 
+			By("inserting 20 validation rows on primary " + primary)
 			_, err := execSQL(primary, createTestDB)
-			// ignore error if already exists
-			_ = err
+			Expect(err).NotTo(HaveOccurred())
 			_, err = execSQL(primary, createTestTable)
-			_ = err
+			Expect(err).NotTo(HaveOccurred())
 			insertTestRows(primary, 20)
 			rowsOnPrimary := countTestRows(primary)
 			Expect(rowsOnPrimary).To(BeNumerically(">", 0))
+
+			By("adding testdb to AG so secondaries receive rows via HADR replication")
+			// Backup + ADD DATABASE: SEEDING_MODE=AUTOMATIC seeds secondaries directly.
+			_, err = execSQL(primary, addDBtoAGSQL)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Wait for VDI seeding to complete on ALL secondaries before checking row counts.
+			// Without this explicit seeding gate, the row-count Eventually fires before the
+			// database even exists on the secondary (exit status 1).  The safety test must
+			// have already waited for all secondaries before cleanup to avoid interrupted-VDI
+			// state contaminating this seeding round (see ag_safety_test.go).
+			By("waiting for testdb VDI seeding to complete on all secondaries")
+			for _, pod := range []string{"mssql-ag-1", "mssql-ag-2"} {
+				if pod == primary {
+					continue
+				}
+				pod := pod
+				Eventually(func(g Gomega) {
+					out, qErr := execSQL(pod,
+						"SET NOCOUNT ON; SELECT synchronization_state_desc "+
+							"FROM sys.dm_hadr_database_replica_states "+
+							"WHERE DB_NAME(database_id) = 'testdb' AND is_local = 1")
+					g.Expect(qErr).NotTo(HaveOccurred(), "seeding check on %s: %v", pod, qErr)
+					g.Expect(out).To(Or(ContainSubstring("SYNCHRONIZING"), ContainSubstring("SYNCHRONIZED")),
+						"testdb not visible in DMV on %s: %s", pod, out)
+				}, 10*time.Minute, 10*time.Second).Should(Succeed(),
+					"testdb VDI seeding never completed on %s", pod)
+			}
 
 			By("waiting for secondaries to reflect same row count")
 			for _, pod := range []string{"mssql-ag-1", "mssql-ag-2"} {
 				if pod == primary {
 					continue
 				}
+				pod := pod // capture loop variable for goroutine safety
 				Eventually(func(g Gomega) {
-					rowsOnSecondary := countTestRows(pod)
-					g.Expect(rowsOnSecondary).To(Equal(rowsOnPrimary),
-						"replica %s has %d rows, primary has %d", pod, rowsOnSecondary, rowsOnPrimary)
-				}, 3*time.Minute, 5*time.Second).Should(Succeed())
+					// Use g.Expect (not global Expect) so failures are retried by Eventually.
+					// countTestRows uses the global Expect and would abort the test immediately.
+					out, err := execSQL(pod, "SET NOCOUNT ON; SELECT COUNT(*) FROM testdb.dbo.t")
+					g.Expect(err).NotTo(HaveOccurred(),
+						"query failed on %s — testdb may still be seeding", pod)
+					var count int
+					for _, line := range strings.Split(out, "\n") {
+						line = strings.TrimSpace(line)
+						if _, scanErr := fmt.Sscanf(line, "%d", &count); scanErr == nil {
+							break
+						}
+					}
+					g.Expect(count).To(Equal(rowsOnPrimary),
+						"replica %s has %d rows, primary has %d", pod, count, rowsOnPrimary)
+				}, 10*time.Minute, 10*time.Second).Should(Succeed(),
+					"secondary %s never reached expected row count %d", pod, rowsOnPrimary)
 			}
 		})
 	})

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net"
 	"strings"
 	"time"
 
@@ -486,9 +487,30 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 		}
 	}
 
-	// Step 5: CREATE AVAILABILITY GROUP on pod-0 (primary).
-	// PodName must match @@SERVERNAME (short hostname); EndpointFQDN is used in ENDPOINT_URL.
+	// Step 5: Verify all replica HADR endpoints are TCP-reachable before creating the AG.
+	// SQL Server (CLUSTER_TYPE = NONE) attempts DNS resolution and TCP connection to each
+	// secondary's HADR endpoint URL the instant CREATE AVAILABILITY GROUP runs. If DNS
+	// has not yet propagated (common on Docker Desktop ARM64 where pod DNS entries can
+	// take 15–30 s to appear in CoreDNS after the pod becomes Ready), the primary records
+	// error 11001 "No such host is known" and does NOT retry — leaving the replicas
+	// permanently DISCONNECTED. By verifying TCP connectivity from the controller pod
+	// (which uses the same CoreDNS) before issuing CREATE AG, we guarantee that DNS is
+	// already available when SQL Server makes its first connection attempt.
 	primaryPod := fmt.Sprintf("%s-0", ag.Name)
+	hadrPort := fmt.Sprintf("%d", endpointPort)
+	for i := range replicas {
+		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		fqdn := fmt.Sprintf("%s.%s", podName, headlessDomain)
+		addr := net.JoinHostPort(fqdn, hadrPort)
+		conn, dialErr := net.DialTimeout("tcp", addr, 3*time.Second)
+		if dialErr != nil {
+			log.Info("HADR endpoint not yet reachable, requeuing", "pod", podName, "addr", addr, "err", dialErr)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		_ = conn.Close()
+		log.Info("HADR endpoint reachable", "pod", podName, "addr", addr)
+	}
+
 	replicaInputs := make([]sqlutil.AGReplicaInput, len(replicas))
 	for i, rep := range replicas {
 		podName := fmt.Sprintf("%s-%d", ag.Name, i)
@@ -523,12 +545,6 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 		if _, createErr := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword, createSQL); createErr != nil {
 			return ctrl.Result{}, fmt.Errorf("could not create AG on primary: %w", createErr)
 		}
-		// Wait for the primary's HADR transport to initialise connection sessions
-		// before secondaries join.  Without this pause the JOIN races the primary's
-		// initial connection attempt and the replicas end up permanently DISCONNECTED
-		// (observed on Docker Desktop ARM64 with SQL Server 2022).
-		log.Info("Waiting for HADR transport to initialise before joining secondaries")
-		time.Sleep(10 * time.Second)
 	} else {
 		log.Info("Availability Group already exists, skipping CREATE", "ag", ag.Spec.AGName)
 	}
@@ -541,6 +557,22 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 			log.Error(err, "Could not join AG on secondary", "pod", secondaryPod)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
+		log.Info("Joined AG on secondary", "pod", secondaryPod)
+	}
+
+	// Step 7: Wait for all secondaries to reach SECONDARY+CONNECTED before declaring
+	// bootstrap complete. If this times out the HADR transport failed to establish —
+	// typically because SQL Server's internal HADR engine attempted its first connection
+	// before the secondaries' HADR transport was fully initialised.  Recovery: drop the AG
+	// on ALL replicas so every instance starts clean. Without dropping on the secondaries,
+	// they retain stale replica-ID state from the failed AG; when the primary creates a
+	// new AG with fresh replica GUIDs, the secondaries reject the connection (ID mismatch)
+	// causing another timeout.  After the full cleanup the next reconcile will recreate
+	// the AG from scratch, and the TCP-reachability check (Step 5) will ensure the HADR
+	// endpoints are reachable before CREATE AVAILABILITY GROUP runs.
+	if !r.waitForSecondariesReady(ctx, exec, ag, primaryPod, saPassword, len(replicas)) {
+		r.dropAGOnAllReplicas(ctx, exec, ag, primaryPod, saPassword, len(replicas))
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	log.Info("AG bootstrap complete", "ag", ag.Spec.AGName)
@@ -549,6 +581,111 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
 	ag.Status.PrimaryReplica = primaryPod
 	return ctrl.Result{}, r.Status().Patch(ctx, ag, patch)
+}
+
+// dropAGOnAllReplicas drops the named AG on every replica so each instance
+// starts with a clean slate before the next CREATE AVAILABILITY GROUP attempt.
+// Secondaries are dropped first to remove their stale replica-ID state; if they
+// are left joined to an AG that no longer exists on the primary, the new primary
+// (with fresh replica GUIDs) cannot establish the HADR transport because the ID
+// mismatch causes the secondary to reject the connection, manifesting as a
+// 10-second timeout on the primary.  Errors are logged but not returned — the
+// caller always requeues after this function regardless of outcome.
+func (r *SQLServerAvailabilityGroupReconciler) dropAGOnAllReplicas(
+	ctx context.Context,
+	sqlExec *sqlutil.Executor,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	primaryPod, saPassword string,
+	replicaCount int,
+) {
+	log := logf.FromContext(ctx)
+	log.Info("Dropping AG on all replicas for clean recreation", "ag", ag.Spec.AGName)
+	dropSQL := fmt.Sprintf("DROP AVAILABILITY GROUP [%s]", ag.Spec.AGName)
+	for i := 1; i < replicaCount; i++ {
+		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
+		if _, err := sqlExec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword, dropSQL); err != nil {
+			log.Error(err, "Could not drop AG on secondary, continuing", "pod", secondaryPod)
+		}
+	}
+	if _, err := sqlExec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword, dropSQL); err != nil {
+		log.Error(err, "Could not drop AG on primary, will requeue anyway")
+	}
+}
+
+// waitForSecondariesReady polls the primary until all secondary replicas report
+// both role_desc = 'SECONDARY' AND connected_state_desc = 'CONNECTED', waiting
+// up to 10 minutes (60 × 10 s). It returns true only after the required state
+// has been observed for requiredConsecutive consecutive polls (default 3, i.e.
+// 30 seconds of stable connectivity), ensuring DNS and HADR transport are
+// genuinely stable before bootstrap is declared complete.
+//
+// Both conditions are required because:
+//   - role_desc = 'SECONDARY' is set by the protocol JOIN message and can be
+//     true even when the HADR TCP transport is DISCONNECTED (e.g. the primary's
+//     first connection attempt failed due to a DNS lookup race right after
+//     CREATE AVAILABILITY GROUP).
+//   - connected_state_desc = 'CONNECTED' confirms the HADR transport session is
+//     actively established, so reads/replication are actually flowing.
+//
+// The consecutive-success requirement guards against transient "blips" where a
+// pod briefly flips to SECONDARY+CONNECTED before DNS or certificates drop the
+// session again (observed on Docker Desktop ARM64 during rapid bootstrap).
+func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
+	ctx context.Context,
+	sqlExec *sqlutil.Executor,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	primaryPod, saPassword string,
+	replicaCount int,
+) bool {
+	log := logf.FromContext(ctx)
+	wantSecondaries := replicaCount - 1
+	const (
+		maxAttempts         = 60 // 60 × 10 s = 10 min total
+		requiredConsecutive = 3  // 3 × 10 s = 30 s stable connectivity required
+	)
+	consecutiveOK := 0
+	log.Info("Waiting for secondaries to reach SECONDARY+CONNECTED state",
+		"ag", ag.Spec.AGName, "expected", wantSecondaries, "requiredConsecutive", requiredConsecutive)
+	for attempt := range maxAttempts {
+		result, qErr := sqlExec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword,
+			sqlutil.SecondaryCountSQL(ag.Spec.AGName))
+		if qErr != nil {
+			consecutiveOK = 0
+			log.Info("Could not query secondary state, will retry", "attempt", attempt, "err", qErr)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		var secondaryCount int
+		for line := range strings.SplitSeq(result.Stdout, "\n") {
+			line = strings.TrimSpace(line)
+			if _, scanErr := fmt.Sscanf(line, "%d", &secondaryCount); scanErr == nil {
+				break
+			}
+		}
+		if secondaryCount >= wantSecondaries {
+			consecutiveOK++
+			log.Info("Secondaries in SECONDARY+CONNECTED state",
+				"ag", ag.Spec.AGName, "count", secondaryCount,
+				"consecutiveOK", consecutiveOK, "required", requiredConsecutive)
+			if consecutiveOK >= requiredConsecutive {
+				log.Info("Secondaries stable, bootstrap complete",
+					"ag", ag.Spec.AGName, "stablePolls", consecutiveOK)
+				return true
+			}
+		} else {
+			if consecutiveOK > 0 {
+				log.Info("Secondaries dropped below required count, resetting consecutive counter",
+					"ag", ag.Spec.AGName, "count", secondaryCount, "expected", wantSecondaries)
+			} else {
+				log.Info("Secondaries not yet ready, retrying",
+					"count", secondaryCount, "expected", wantSecondaries, "attempt", attempt)
+			}
+			consecutiveOK = 0
+		}
+		time.Sleep(10 * time.Second)
+	}
+	log.Info("Timed out waiting for secondaries to reach SECONDARY+CONNECTED state", "ag", ag.Spec.AGName)
+	return false
 }
 
 // certNameForPod returns the SQL certificate name for a given pod name.

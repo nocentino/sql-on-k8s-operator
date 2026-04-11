@@ -105,6 +105,13 @@ func deployOperator(image string) {
 	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy controller-manager")
 
+	// Force a rollout restart so that if a stale pod from a previous test run (same image
+	// tag) is still running, it gets replaced with a fresh pod that runs the current image.
+	By("restarting the controller-manager to ensure the current image is running")
+	cmd = exec.Command("kubectl", "rollout", "restart", "deployment/sql-on-k8s-operator-controller-manager",
+		"-n", "sql-on-k8s-operator-system")
+	_, _ = utils.Run(cmd) // best-effort: may fail if deployment doesn't exist yet
+
 	By("waiting for controller-manager to be ready")
 	Eventually(func(g Gomega) {
 		cmd := exec.Command("kubectl", "get", "pods",
@@ -151,6 +158,20 @@ func setupAG() {
 
 	By("waiting for AG bootstrap to complete (up to 20 minutes)")
 	waitForAGBootstrap("mssql-ag", 20*time.Minute)
+
+	// After the HADR transport is established (initializationComplete=true), SQL Server
+	// on each secondary continues internal initialization that can block client logins
+	// for several minutes.  Wait here so that individual tests do not race against that
+	// initialization window.
+	By("waiting for all replica pods to accept SQL connections")
+	waitForAllReplicasSQLReady([]string{"mssql-ag-0", "mssql-ag-1", "mssql-ag-2"}, 10*time.Minute)
+
+	// Wait until all secondaries report CONNECTED from the primary's perspective.
+	// synchronization_health_desc is NOT_HEALTHY for an empty AG (nothing to synchronize),
+	// so connected_state_desc = CONNECTED is the right readiness signal here — the same
+	// signal the controller uses to set initializationComplete=true.
+	By("waiting for all secondaries to be CONNECTED from the primary's perspective")
+	waitForReplicasConnected("mssql-ag-0", "AG1", 2, 5*time.Minute)
 }
 
 // teardownAG deletes the AG CR and its PVCs.

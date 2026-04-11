@@ -75,18 +75,24 @@ JOIN sys.dm_hadr_availability_replica_states rs ON ag.group_id = rs.group_id
 WHERE ag.name = 'AG1' AND rs.is_local = 1`)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(strings.TrimSpace(out)).To(Equal("SECONDARY"), "pod %s not secondary", pod)
-			}, 3*time.Minute, 10*time.Second).Should(Succeed())
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 		}
 	})
 
-	It("should have synchronous replicas in SYNCHRONIZED state", func() {
+	It("should have secondaries CONNECTED to the primary", func() {
+		// For an empty AG (no databases), synchronization_health_desc stays NOT_HEALTHY because
+		// there is nothing to synchronize.  The meaningful readiness signal for an empty AG is
+		// connected_state_desc = 'CONNECTED' — the same check the controller uses before it sets
+		// initializationComplete=true.  BeforeSuite already confirmed this; the Eventually here
+		// is a lightweight guard in case the transport briefly wobbled.
 		Eventually(func(g Gomega) {
 			out, err := execSQL("mssql-ag-0", `
 SET NOCOUNT ON;
 SELECT COUNT(*) FROM sys.dm_hadr_availability_replica_states rs
-JOIN sys.availability_replicas r ON rs.replica_id = r.replica_id
-WHERE rs.synchronization_state_desc = 'SYNCHRONIZED'
-  AND r.availability_mode = 1`)
+JOIN sys.availability_groups ag ON rs.group_id = ag.group_id
+WHERE ag.name = 'AG1'
+  AND rs.role_desc = 'SECONDARY'
+  AND rs.connected_state_desc = 'CONNECTED'`)
 			g.Expect(err).NotTo(HaveOccurred())
 			var count int
 			for _, line := range strings.Split(out, "\n") {
@@ -95,8 +101,8 @@ WHERE rs.synchronization_state_desc = 'SYNCHRONIZED'
 					break
 				}
 			}
-			// primary + 1 synchronous secondary = at least 2
-			g.Expect(count).To(BeNumerically(">=", 2), "Expected >=2 SYNCHRONIZED replicas")
+			// expect both secondaries CONNECTED (mssql-ag-1 and mssql-ag-2)
+			g.Expect(count).To(BeNumerically(">=", 2), "Expected >=2 CONNECTED secondaries, got %d", count)
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 	})
 

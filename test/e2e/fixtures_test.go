@@ -153,19 +153,30 @@ BEGIN
 END
 `
 
-// addDBToAG adds testdb to the AG (run on primary after backup is taken).
+// addDBToAG takes a full backup of testdb then adds it to the AG.
+// With SEEDING_MODE = AUTOMATIC the primary VDI-seeds secondaries automatically.
+// Use this when the secondaries have never had testdb (first-time seeding).
 const addDBtoAGSQL = `
 BACKUP DATABASE testdb TO DISK = '/var/opt/mssql/data/testdb.bak' WITH INIT, FORMAT;
 ALTER AVAILABILITY GROUP AG1 ADD DATABASE testdb;
 `
 
-// joinDBOnSecondary restores and joins testdb on a secondary pod.
-const joinDBOnSecondarySQL = `
-RESTORE DATABASE testdb
-  FROM DISK = '/var/opt/mssql/data/testdb.bak'
-  WITH NORECOVERY, REPLACE;
-ALTER DATABASE testdb SET HADR AVAILABILITY GROUP = AG1;
-`
+// backupTestDBSQL takes a full backup of testdb without adding it to the AG.
+// Used when the caller needs to pre-restore the backup on secondaries BEFORE
+// the ADD DATABASE step to avoid conflicts with automatic seeding.
+const backupTestDBSQL = `BACKUP DATABASE testdb TO DISK = '/var/opt/mssql/data/testdb.bak' WITH INIT, FORMAT;`
+
+// addTestDBtoAGSQL adds the already-backed-up testdb to the AG.
+// Run on primary AFTER secondaries have been pre-restored WITH NORECOVERY.
+const addTestDBtoAGSQL = `ALTER AVAILABILITY GROUP AG1 ADD DATABASE testdb;`
+
+// restoreTestDBForHADR restores testdb on a secondary in NORECOVERY state,
+// ready to join the AG. Run BEFORE addTestDBtoAGSQL on the primary.
+const restoreTestDBForHADR = `RESTORE DATABASE testdb FROM DISK = '/var/opt/mssql/data/testdb.bak' WITH NORECOVERY, REPLACE;`
+
+// joinDBOnSecondarySQL joins an already-restored testdb to the named AG.
+// Run AFTER addTestDBtoAGSQL on the primary.
+const joinDBOnSecondarySQL = `ALTER DATABASE testdb SET HADR AVAILABILITY GROUP = AG1;`
 
 // removeDBFromAGSQL removes testdb from the AG gracefully (run on primary).
 const removeDBFromAGSQL = `ALTER AVAILABILITY GROUP AG1 REMOVE DATABASE testdb;`

@@ -1,0 +1,68 @@
+# Claude Code GitHub Actions Integration
+#
+# This workflow enables Claude to respond to @claude mentions in issues and
+# pull requests, analyze the codebase, implement fixes, and open pull requests.
+#
+# Prerequisites (one-time setup):
+#   1. Install the Claude GitHub App on this repository:
+#      https://github.com/apps/claude
+#   2. Add your Anthropic API key as a repository secret named ANTHROPIC_API_KEY:
+#      Settings → Secrets and variables → Actions → New repository secret
+#
+# Usage:
+#   - In any issue comment, write "@claude <description of what you want>"
+#   - In any PR comment, write "@claude <request>"
+#   - When a new issue is opened with "@claude" in the body, Claude responds automatically
+#
+# Examples:
+#   "@claude fix the failing test in internal/controller/sqlserveravailabilitygroup_controller_test.go"
+#   "@claude add validation to reject an AG spec with 0 replicas"
+#   "@claude review this PR and suggest improvements"
+
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+# Minimal permissions — the action requests elevated scopes only when needed
+permissions:
+  contents: write        # read repo, write commits/branches for fix PRs
+  pull-requests: write   # open and comment on PRs
+  issues: write          # post responses on issues
+  id-token: write        # OIDC (not required for direct API; harmless to include)
+
+jobs:
+  claude:
+    name: Claude Code
+    # Only run when @claude is explicitly mentioned to avoid accidental triggers
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # GitHub token with write access so Claude can push fix branches and open PRs
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Trigger phrase (default is @claude)
+          trigger_phrase: "@claude"
+          # Allow Claude to use make targets for build and test validation
+          claude_args: >-
+            --max-turns 30
+            --allowedTools "Bash(go build ./...),Bash(go test ./...),Bash(make build),Bash(make test),Bash(make manifests),Bash(make generate),Bash(make lint-fix)"

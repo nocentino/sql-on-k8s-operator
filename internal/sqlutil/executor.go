@@ -171,11 +171,15 @@ func (e *Executor) WriteFileToPod(ctx context.Context, namespace, podName, conta
 	return nil
 }
 
-// GetAGSyncState returns the synchronization state for the replica in the named AG.
+// GetAGSyncState returns the synchronization health for the local replica in the named AG.
+// It queries synchronization_health_desc from sys.dm_hadr_availability_replica_states,
+// which returns HEALTHY, PARTIALLY_HEALTHY, or NOT_HEALTHY at the replica level.
+// Note: synchronization_state_desc (SYNCHRONIZED/SYNCHRONIZING) is a database-level column
+// found only in sys.dm_hadr_database_replica_states, not in the replica-level DMV.
 func (e *Executor) GetAGSyncState(ctx context.Context, namespace, podName, containerName, saPassword, agName string) (string, error) {
 	query := fmt.Sprintf(`
 SET NOCOUNT ON;
-SELECT rs.synchronization_state_desc
+SELECT rs.synchronization_health_desc
 FROM sys.availability_groups ag
 JOIN sys.dm_hadr_availability_replica_states rs ON ag.group_id = rs.group_id
 WHERE ag.name = '%s' AND rs.is_local = 1;`, agName)

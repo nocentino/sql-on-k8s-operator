@@ -54,7 +54,8 @@ func execSQL(pod, query string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// waitForAGBootstrap polls until InitializationComplete is true or timeout.
+// waitForAGBootstrap polls until InitializationComplete is true.
+// The controller sets this flag only after all replicas have reached CONNECTED state.
 func waitForAGBootstrap(agName string, timeout time.Duration) {
 	GinkgoHelper()
 	Eventually(func(g Gomega) {
@@ -63,6 +64,50 @@ func waitForAGBootstrap(agName string, timeout time.Duration) {
 		out, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(out).To(Equal("true"), "AG bootstrap not complete yet")
+	}, timeout, 10*time.Second).Should(Succeed())
+}
+
+// waitForAllReplicasSQLReady polls until every listed pod accepts a SQL connection.
+// SQL Server on a secondary can take several minutes after the HADR transport connects
+// before it processes regular client logins, so tests must not start until this passes.
+func waitForAllReplicasSQLReady(pods []string, timeout time.Duration) {
+	GinkgoHelper()
+	for _, pod := range pods {
+		p := pod
+		Eventually(func(g Gomega) {
+			out, err := execSQL(p, "SET NOCOUNT ON; SELECT 1")
+			g.Expect(err).NotTo(HaveOccurred(), "SQL not ready on pod %s", p)
+			g.Expect(out).To(ContainSubstring("1"), "SELECT 1 returned unexpected output on %s: %s", p, out)
+		}, timeout, 10*time.Second).Should(Succeed(), "pod %s never accepted SQL connections", p)
+	}
+}
+
+// waitForReplicasConnected polls the primary until all secondaries report
+// connected_state_desc = 'CONNECTED'.  This is the same signal the controller
+// uses when it sets initializationComplete=true, so it is meaningful even for
+// empty AGs where synchronization_health_desc may remain NOT_HEALTHY until at
+// least one database is added.
+// Expects at least wantConnected CONNECTED secondaries.
+func waitForReplicasConnected(primaryPod, agName string, wantConnected int, timeout time.Duration) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		out, err := execSQL(primaryPod, fmt.Sprintf(`
+SET NOCOUNT ON;
+SELECT COUNT(*) FROM sys.dm_hadr_availability_replica_states rs
+JOIN sys.availability_groups ag ON rs.group_id = ag.group_id
+WHERE ag.name = '%s'
+  AND rs.role_desc = 'SECONDARY'
+  AND rs.connected_state_desc = 'CONNECTED'`, agName))
+		g.Expect(err).NotTo(HaveOccurred(), "Failed to query replica connection state on %s", primaryPod)
+		var count int
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if _, scanErr := fmt.Sscanf(line, "%d", &count); scanErr == nil {
+				break
+			}
+		}
+		g.Expect(count).To(BeNumerically(">=", wantConnected),
+			"Expected >=%d CONNECTED secondaries, got %d", wantConnected, count)
 	}, timeout, 10*time.Second).Should(Succeed())
 }
 
@@ -116,6 +161,33 @@ func countTestRows(pod string) int {
 	return -1
 }
 
+// copyBackupBetweenPods copies a SQL Server backup file from sourcePod to targetPod
+// via a local temp file. This is required because each pod has its own PVC and the
+// backup file on the primary is not accessible from secondary pods directly.
+func copyBackupBetweenPods(sourcePod, targetPod, remotePath string) error {
+	f, err := os.CreateTemp("", "backup-*.bak")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	f.Close()
+	defer os.Remove(f.Name())
+
+	copyFrom := exec.Command("kubectl", "cp",
+		fmt.Sprintf("%s/%s:%s", agNamespace, sourcePod, remotePath),
+		f.Name())
+	if out, err := copyFrom.CombinedOutput(); err != nil {
+		return fmt.Errorf("kubectl cp from %s: %w\n%s", sourcePod, err, out)
+	}
+
+	copyTo := exec.Command("kubectl", "cp",
+		f.Name(),
+		fmt.Sprintf("%s/%s:%s", agNamespace, targetPod, remotePath))
+	if out, err := copyTo.CombinedOutput(); err != nil {
+		return fmt.Errorf("kubectl cp to %s: %w\n%s", targetPod, err, out)
+	}
+	return nil
+}
+
 // captureArtifacts saves logs, events, and AG CR state to the artifact directory on failure.
 func captureArtifacts(testName string) {
 	if !CurrentSpecReport().Failed() {
@@ -146,10 +218,13 @@ func captureArtifacts(testName string) {
 		"-o", "yaml").CombinedOutput(); err == nil {
 		_ = os.WriteFile(filepath.Join(dir, "sqlag.yaml"), out, 0o644)
 	}
-	// AG SQL state (best-effort)
+	// AG SQL state (best-effort).
+	// Uses synchronization_health_desc (replica-level aggregate: HEALTHY/PARTIALLY_HEALTHY/NOT_HEALTHY)
+	// from sys.dm_hadr_availability_replica_states.  synchronization_state_desc is only available
+	// in the database-level DMV sys.dm_hadr_database_replica_states.
 	for i := 0; i < 3; i++ {
 		pod := fmt.Sprintf("mssql-ag-%d", i)
-		q := "SET NOCOUNT ON; SELECT replica_id, role_desc, synchronization_state_desc, connected_state_desc " +
+		q := "SET NOCOUNT ON; SELECT replica_id, role_desc, synchronization_health_desc, connected_state_desc " +
 			"FROM sys.dm_hadr_availability_replica_states;"
 		if out, err := execSQL(pod, q); err == nil {
 			_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s-ag-state.txt", pod)), []byte(out), 0o644)
