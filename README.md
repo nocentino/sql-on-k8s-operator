@@ -1,121 +1,251 @@
 # sql-on-k8s-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator for **SQL Server on Linux** that automates the full lifecycle of standalone instances and Always On Availability Groups (AG).
 
-## Getting Started
+## Overview
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+The operator provides two custom resources:
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+| Kind | API | Purpose |
+|------|-----|---------|
+| `SQLServerInstance` | `sql.mssql.microsoft.com/v1alpha1` | Standalone SQL Server — one pod, one PVC, one Service |
+| `SQLServerAvailabilityGroup` | `sql.mssql.microsoft.com/v1alpha1` | Multi-replica AG with automatic T-SQL bootstrap, certificate-based endpoint auth, and read-write / read-only listener Services |
+
+### What the operator manages
+
+**SQLServerInstance** — for each CR the operator creates and reconciles:
+- A `ConfigMap` containing `mssql.conf` (memory limits, SQL Agent, arbitrary settings)
+- A `StatefulSet` with a single SQL Server pod and a persistent data volume
+- A headless `Service` (pod DNS) and a ClusterIP `Service` (client access)
+- Status conditions including `Available` and the current pod phase
+
+**SQLServerAvailabilityGroup** — for each CR the operator creates and reconciles:
+- A `StatefulSet` with one pod per replica, each with its own PVC
+- A headless `Service` for intra-cluster DNS (`<pod>.<ag>.svc.cluster.local`)
+- A `ConfigMap` with `mssql.conf` applied to every replica
+- Certificate-based AG endpoint authentication (self-signed, managed by the operator)
+- T-SQL bootstrap: `CREATE AVAILABILITY GROUP … WITH (CLUSTER_TYPE = NONE)` with `SEEDING_MODE = AUTOMATIC`
+- A read-write **listener** `Service` whose selector tracks the current PRIMARY replica
+- An optional read-only **listener** `Service` that targets readable SECONDARY replicas with `ClientIP` session affinity
+- Per-replica status (role, synchronization state, connected)
+
+## Prerequisites
+
+- Go **1.25+**
+- Docker **17.03+** (or compatible container runtime)
+- kubectl **v1.11.3+**
+- A Kubernetes **v1.11.3+** cluster
+- [cert-manager](https://cert-manager.io/) is **not** required — the operator manages its own certificates
+
+## Quick Start
+
+### 1. Deploy the operator
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/sql-on-k8s-operator:tag
-```
+# Build and push the controller image
+make docker-build docker-push IMG=<registry>/sql-on-k8s-operator:latest
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
+# Install CRDs
 make install
+
+# Deploy the controller
+make deploy IMG=<registry>/sql-on-k8s-operator:latest
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### 2. Create a standalone SQL Server instance
 
 ```sh
-make deploy IMG=<some-registry>/sql-on-k8s-operator:tag
+# Create the SA password secret
+kubectl create secret generic mssql-secret \
+  --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
+
+# Apply the sample CR
+kubectl apply -f config/samples/sql_v1alpha1_sqlserverinstance.yaml
+
+# Watch until Available
+kubectl get sqli mssql-standalone -w
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Sample CR (`config/samples/sql_v1alpha1_sqlserverinstance.yaml`):
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
+```yaml
+apiVersion: sql.mssql.microsoft.com/v1alpha1
+kind: SQLServerInstance
+metadata:
+  name: mssql-standalone
+  namespace: default
+spec:
+  image: mcr.microsoft.com/mssql/server:2022-latest
+  edition: Developer
+  acceptEula: "Y"
+  saPasswordSecretRef:
+    name: mssql-secret
+    key: SA_PASSWORD
+  port: 1433
+  storage:
+    dataVolumeSize: "10Gi"
+  mssqlConf:
+    "memory.memorylimitmb": "2048"
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2"
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+### 3. Create an Availability Group
 
 ```sh
+# Create the SA password secret
+kubectl create secret generic mssql-ag-secret \
+  --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
+
+# Apply the sample CR
+kubectl apply -f config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml
+
+# Watch bootstrap — initializationComplete flips to true when the AG is ready
+kubectl get sqlag mssql-ag -w
+```
+
+Sample CR (`config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml`):
+
+```yaml
+apiVersion: sql.mssql.microsoft.com/v1alpha1
+kind: SQLServerAvailabilityGroup
+metadata:
+  name: mssql-ag
+  namespace: default
+spec:
+  agName: "AG1"
+  image: mcr.microsoft.com/mssql/server:2022-latest
+  edition: Developer
+  acceptEula: "Y"
+  saPasswordSecretRef:
+    name: mssql-ag-secret
+    key: SA_PASSWORD
+  endpointPort: 5022
+  replicas:
+    - name: primary
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+    - name: secondary-1
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+    - name: secondary-2
+      availabilityMode: AsynchronousCommit
+      failoverMode: Manual
+      readableSecondary: true
+  storage:
+    dataVolumeSize: "20Gi"
+  mssqlConf:
+    "memory.memorylimitmb": "2048"
+  listener:
+    name: mssql-ag-listener
+    port: 1433
+    serviceType: ClusterIP
+  readOnlyListener:
+    name: mssql-ag-listener-ro
+    port: 1433
+    serviceType: ClusterIP
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2"
+```
+
+## API Reference
+
+### SQLServerInstance spec fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `image` | string | `mcr.microsoft.com/mssql/server:2022-latest` | SQL Server container image |
+| `edition` | string | `Developer` | `Developer`, `Express`, `Standard`, `Enterprise`, `EnterpriseCore` |
+| `acceptEula` | string | `Y` | Must be `Y` to accept the SQL Server EULA |
+| `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
+| `port` | int32 | `1433` | TCP port SQL Server listens on |
+| `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size for data and log files |
+| `storage.storageClassName` | string | — | StorageClass name (cluster default if omitted) |
+| `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` |
+| `resources` | ResourceRequirements | — | CPU and memory requests/limits |
+| `timezone` | string | — | TZ environment variable for the container |
+| `additionalEnvVars` | []EnvVar | — | Extra environment variables injected into the pod |
+
+### SQLServerAvailabilityGroup spec fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agName` | string | — | T-SQL name of the Availability Group |
+| `image` | string | `mcr.microsoft.com/mssql/server:2022-latest` | SQL Server container image (all replicas) |
+| `edition` | string | `Developer` | SQL Server edition |
+| `acceptEula` | string | `Y` | Must be `Y` |
+| `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
+| `endpointPort` | int32 | `5022` | TCP port for the AG mirroring endpoint |
+| `replicas` | []AGReplicaSpec | — | 1–9 replica definitions (see below) |
+| `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size per replica |
+| `storage.storageClassName` | string | — | StorageClass name |
+| `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` on every replica; `hadr.hadrenabled=1` is always set automatically |
+| `listener` | ListenerSpec | — | Read-write Service pointing at the current PRIMARY |
+| `readOnlyListener` | ListenerSpec | — | Read-only Service pointing at readable SECONDARY replicas |
+| `resources` | ResourceRequirements | — | CPU and memory requests/limits per replica |
+| `nodeSelector` | map[string]string | — | Node label constraints for all replica pods |
+| `tolerations` | []Toleration | — | Pod tolerations for all replica pods |
+
+**AGReplicaSpec fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | — | Replica name (used as the pod name suffix) |
+| `availabilityMode` | string | `SynchronousCommit` | `SynchronousCommit` or `AsynchronousCommit` |
+| `failoverMode` | string | `Automatic` | `Automatic` or `Manual` |
+| `readableSecondary` | bool | `false` | Allow read queries on this secondary (`SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)`) |
+
+### SQLServerAvailabilityGroup status fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `initializationComplete` | bool | `true` once the AG T-SQL bootstrap has completed |
+| `primaryReplica` | string | Pod name of the current PRIMARY replica |
+| `phase` | string | Overall lifecycle phase |
+| `replicaStatuses` | []AGReplicaStatus | Per-replica role, synchronization state, and connectivity |
+
+## Uninstall
+
+```sh
+# Remove CRs
 kubectl delete -k config/samples/
-```
 
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
+# Remove the controller and CRDs
+make undeploy
 make uninstall
 ```
 
-**UnDeploy the controller from the cluster:**
+## Development
 
 ```sh
-make undeploy
+# Run unit tests
+make test
+
+# Run end-to-end tests against the current kubeconfig context
+make test-e2e
+
+# Regenerate CRDs and RBAC after editing *_types.go
+make manifests generate
+
+# Auto-fix lint issues
+make lint-fix
+
+# Run locally (no in-cluster deployment required)
+make run
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/sql-on-k8s-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/sql-on-k8s-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+Run `make help` for the full list of available targets.
 
 ## License
 
@@ -132,4 +262,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
