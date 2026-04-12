@@ -228,10 +228,17 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileAGStatefulSet(ctx contex
 	if err != nil {
 		return err
 	}
+	// Reconcile mutable fields from the desired StatefulSet into the live object.
+	// VolumeClaimTemplates and Selector are immutable after creation so they are
+	// intentionally left unchanged.
 	replicas := int32(len(ag.Spec.Replicas))
 	sts.Spec.Replicas = &replicas
-	sts.Spec.Template.Spec.Containers[0].Image = ag.Spec.Image
-	sts.Spec.Template.Spec.Containers[0].Resources = ag.Spec.Resources
+	sts.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
+	sts.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
+	sts.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
+	sts.Spec.Template.Spec.Containers[0].Ports = desired.Spec.Template.Spec.Containers[0].Ports
+	sts.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+	sts.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
 	return r.Update(ctx, sts)
 }
 
@@ -241,16 +248,17 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileAGHeadlessService(ctx co
 	svcName := ag.Name + "-headless"
 	svc := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: ag.Namespace}, svc)
+	desiredPorts := []corev1.ServicePort{
+		{Name: "mssql", Port: 1433, TargetPort: intstr.FromInt32(1433)},
+		{Name: "hadr", Port: ag.Spec.EndpointPort, TargetPort: intstr.FromInt32(ag.Spec.EndpointPort)},
+	}
 	if errors.IsNotFound(err) {
 		newSvc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: ag.Namespace, Labels: labels},
 			Spec: corev1.ServiceSpec{
 				ClusterIP: "None",
 				Selector:  labels,
-				Ports: []corev1.ServicePort{
-					{Name: "mssql", Port: 1433, TargetPort: intstr.FromInt32(1433)},
-					{Name: "hadr", Port: ag.Spec.EndpointPort, TargetPort: intstr.FromInt32(ag.Spec.EndpointPort)},
-				},
+				Ports:     desiredPorts,
 			},
 		}
 		if err2 := controllerutil.SetControllerReference(ag, newSvc, r.Scheme); err2 != nil {
@@ -258,7 +266,15 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileAGHeadlessService(ctx co
 		}
 		return r.Create(ctx, newSvc)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// Patch the existing headless service so the selector and ports stay in sync
+	// (e.g. when spec.endpointPort changes).
+	patch := client.MergeFrom(svc.DeepCopy())
+	svc.Spec.Selector = labels
+	svc.Spec.Ports = desiredPorts
+	return r.Patch(ctx, svc, patch)
 }
 
 // reconcileListenerService creates or updates the read-write AG listener Service.
@@ -885,6 +901,45 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 	// This is best-effort: a labelling failure should not prevent status from being saved.
 	if labelErr := r.reconcilePodLabels(ctx, ag, replicaRoles); labelErr != nil {
 		logf.FromContext(ctx).Error(labelErr, "Could not reconcile pod AG role labels")
+	}
+
+	// Set standard status conditions so users can use kubectl wait --for=condition=...
+	if ag.Status.InitializationComplete {
+		apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+			Type:               "Initialized",
+			Status:             metav1.ConditionTrue,
+			Reason:             "BootstrapComplete",
+			Message:            "AG bootstrap completed successfully",
+			ObservedGeneration: ag.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+	}
+	if foundPrimary {
+		// Count healthy replicas to determine overall availability.
+		healthyCount := 0
+		for _, s := range statuses {
+			if s.Connected && s.SynchronizationState == "HEALTHY" {
+				healthyCount++
+			}
+		}
+		msg := fmt.Sprintf("Primary is %s; %d/%d replicas healthy", ag.Status.PrimaryReplica, healthyCount, len(statuses))
+		apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+			Type:               sqlv1alpha1.ConditionAvailable,
+			Status:             metav1.ConditionTrue,
+			Reason:             "PrimaryHealthy",
+			Message:            msg,
+			ObservedGeneration: ag.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+	} else {
+		apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+			Type:               sqlv1alpha1.ConditionAvailable,
+			Status:             metav1.ConditionFalse,
+			Reason:             "NoPrimary",
+			Message:            "No replica is currently serving as PRIMARY",
+			ObservedGeneration: ag.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
 	}
 
 	return r.Status().Patch(ctx, ag, patch)

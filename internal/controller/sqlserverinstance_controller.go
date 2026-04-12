@@ -142,9 +142,15 @@ func (r *SQLServerInstanceReconciler) reconcileStatefulSet(ctx context.Context, 
 		return err
 	}
 
-	// Update image for rolling upgrades and resource changes
-	sts.Spec.Template.Spec.Containers[0].Image = instance.Spec.Image
-	sts.Spec.Template.Spec.Containers[0].Resources = instance.Spec.Resources
+	// Reconcile mutable fields from the desired StatefulSet into the live object.
+	// VolumeClaimTemplates and Selector are immutable after creation so they are
+	// intentionally left unchanged.
+	sts.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
+	sts.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
+	sts.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
+	sts.Spec.Template.Spec.Containers[0].Ports = desired.Spec.Template.Spec.Containers[0].Ports
+	sts.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+	sts.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
 	return r.Update(ctx, sts)
 }
 

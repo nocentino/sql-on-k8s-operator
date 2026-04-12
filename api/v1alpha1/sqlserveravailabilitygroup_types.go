@@ -137,8 +137,11 @@ type ListenerSpec struct {
 // +kubebuilder:validation:XValidation:rule="!self.replicas.exists(r, r.failoverMode == 'Automatic') || self.clusterType == 'EXTERNAL'",message="failoverMode Automatic on any replica requires clusterType: EXTERNAL"
 type SQLServerAvailabilityGroupSpec struct {
 	// AGName is the name of the SQL Server Availability Group (T-SQL).
+	// Must start with a letter or underscore and contain only letters, digits, and underscores.
+	// This restriction prevents SQL injection via bracket-escaped identifiers in generated T-SQL.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern="^[A-Za-z_][A-Za-z0-9_]*$"
 	AGName string `json:"agName"`
 
 	// Image is the SQL Server container image for all replicas.

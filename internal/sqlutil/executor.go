@@ -278,9 +278,12 @@ WHERE ag.name = '%s' AND rs.is_local = 1;`, agName)
 		return "", err
 	}
 
+	// Parse output the same way GetAGRole does: only return recognised values,
+	// skipping the column header and separator lines that sqlcmd always emits.
 	for line := range strings.SplitSeq(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" && line != "---" {
+		switch line {
+		case "HEALTHY", "PARTIALLY_HEALTHY", "NOT_HEALTHY":
 			return line, nil
 		}
 	}

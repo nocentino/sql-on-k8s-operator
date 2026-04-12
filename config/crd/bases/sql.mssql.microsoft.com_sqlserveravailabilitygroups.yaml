@@ -71,9 +71,12 @@ spec:
                 - "y"
                 type: string
               agName:
-                description: AGName is the name of the SQL Server Availability Group
-                  (T-SQL).
+                description: |-
+                  AGName is the name of the SQL Server Availability Group (T-SQL).
+                  Must start with a letter or underscore and contain only letters, digits, and underscores.
+                  This restriction prevents SQL injection via bracket-escaped identifiers in generated T-SQL.
                 maxLength: 128
+                pattern: ^[A-Za-z_][A-Za-z0-9_]*$
                 type: string
               automaticFailover:
                 description: |-

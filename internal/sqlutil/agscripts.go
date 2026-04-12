@@ -95,13 +95,20 @@ WHERE ag.name = '%s'
   AND rs.is_local = 0;`, agName)
 }
 
+// escapeSQLString escapes single quotes for use inside T-SQL string literals.
+// SQL Server uses doubled single quotes (”) as the escape sequence for a literal
+// single quote inside a string delimited by single quotes.
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // CreateMasterKeySQL returns the T-SQL to create the database master key.
 func CreateMasterKeySQL(password string) string {
 	return fmt.Sprintf(`
 IF NOT EXISTS (SELECT * FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
 BEGIN
     CREATE MASTER KEY ENCRYPTION BY PASSWORD = '%s';
-END`, password)
+END`, escapeSQLString(password))
 }
 
 // CreateCertificateSQL returns T-SQL to create the AG endpoint certificate if it doesn't exist.
