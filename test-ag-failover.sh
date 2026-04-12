@@ -398,7 +398,30 @@ phase_unplanned() {
         sleep 5
     done
 
-    check_replica_health "After crashed pod recovered as secondary — final state"
+    # Wait for the synchronous replica (the crashed pod) to reach SYNCHRONIZED before
+    # the final health check. The async replica (mssql-ag-2) will remain SYNCHRONIZING —
+    # that is its correct steady state and is not waited on here.
+    info "Waiting up to 120s for the synchronous replica ${primary} to reach SYNCHRONIZED..."
+    local sync_deadline=$(( SECONDS + 120 ))
+    while [[ $SECONDS -lt $sync_deadline ]]; do
+        local sync_state
+        sync_state=$(sqlcmd_listener \
+            "SET NOCOUNT ON;
+             SELECT drs.synchronization_state_desc
+             FROM sys.dm_hadr_database_replica_states drs
+             JOIN sys.availability_replicas r ON drs.replica_id = r.replica_id
+             WHERE r.replica_server_name = '${primary}' AND drs.is_local = 0" \
+            2>/dev/null | tr -d ' \r' | grep -E '^[A-Z_]+$' | head -1 || echo "UNKNOWN")
+
+        if [[ "$sync_state" == "SYNCHRONIZED" ]]; then
+            ok "${primary} is SYNCHRONIZED"
+            break
+        fi
+        info "  ${primary} sync state: ${sync_state} — waiting..."
+        sleep 5
+    done
+
+    check_replica_health "All replicas confirmed healthy — test complete"
 
     kill "${log_pid}" 2>/dev/null || true
     ok "Phase 5 complete — unplanned failover exercised"
