@@ -693,7 +693,9 @@ func (r *SQLServerAvailabilityGroupReconciler) dropAGOnAllReplicas(
 
 // waitForSecondariesReady polls the primary until all secondary replicas report
 // both role_desc = 'SECONDARY' AND connected_state_desc = 'CONNECTED', waiting
-// up to 10 minutes (60 × 10 s).
+// up to 10 minutes (60 × 10 s). The sleep between each attempt is
+// context-aware: if the context is cancelled (operator restart, CR deletion,
+// etc.) the function returns false immediately rather than blocking.
 //
 // Both conditions are required because:
 //   - role_desc = 'SECONDARY' is set by the protocol JOIN message and can be
@@ -738,7 +740,12 @@ func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
 		if qErr != nil {
 			consecutiveOK = 0
 			log.Info("Could not query secondary state, will retry", "attempt", attempt, "err", qErr)
-			time.Sleep(10 * time.Second)
+			select {
+			case <-ctx.Done():
+				log.Info("Context cancelled while waiting for secondaries", "ag", ag.Spec.AGName)
+				return false
+			case <-time.After(10 * time.Second):
+			}
 			continue
 		}
 		var secondaryCount int
@@ -768,7 +775,12 @@ func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
 			}
 			consecutiveOK = 0
 		}
-		time.Sleep(10 * time.Second)
+		select {
+		case <-ctx.Done():
+			log.Info("Context cancelled while waiting for secondaries", "ag", ag.Spec.AGName)
+			return false
+		case <-time.After(10 * time.Second):
+		}
 	}
 	log.Info("Timed out waiting for secondaries to reach SECONDARY+CONNECTED state", "ag", ag.Spec.AGName)
 	return false
