@@ -171,6 +171,84 @@ spec:
       cpu: "2"
 ```
 
+## Example Workflow — AG Failover Testing
+
+A self-contained test script, `test-ag-failover.sh`, ships with the repository. It deploys a three-replica AG, seeds a test database, and exercises both planned and unplanned automatic failover end-to-end with health checks at every state transition.
+
+### Prerequisites
+
+- `kubectl` pointed at a cluster with the operator already deployed (see [Quick Start](#quick-start))
+- `sqlcmd` on your PATH — install via [mssql-tools18](https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-setup-tools)
+- `python3` for JSON pretty-printing of operator status
+
+### Phases
+
+The script is composed of five independent phases that can be run individually or all at once:
+
+| Phase | Command | What it does |
+|---|---|---|
+| 1 — Deploy | `deploy` | Tears down any existing AG (drops the SQL Server AG, deletes the CR and PVCs for a clean slate), creates the SA password secret, applies the sample CR, and waits for all pods to be Ready |
+| 2 — Verify | `verify` | Waits for bootstrap to complete (`InitializationComplete=true`), shows pod labels, listener services, and an initial replica health snapshot |
+| 3 — Add database | `adddb` | Creates `testdb`, backs it up, adds it to the AG, waits for all synchronous replicas to reach `HEALTHY`; shows health snapshots before and after seeding |
+| 4 — Planned failover | `planned` | Auto-detects the first synchronous secondary, port-forwards to it, issues `ALTER AVAILABILITY GROUP FAILOVER` with the required external-cluster session context, waits for the operator to update `status.primaryReplica`, and shows three health snapshots (pre-DDL, mid-transition, settled) |
+| 5 — Unplanned failover | `unplanned` | Sends `SIGKILL` to `sqlservr` inside the primary pod to simulate a crash, watches the operator timer count down, confirms promotion of the new primary, waits for the crashed pod to rejoin as a synchronous secondary and reach `SYNCHRONIZED`, then shows a final all-clear health snapshot |
+
+### Running the full test
+
+```bash
+# Make the script executable (first time only)
+chmod +x test-ag-failover.sh
+
+# Run all five phases in order
+./test-ag-failover.sh all
+
+# Or run phases individually
+./test-ag-failover.sh deploy
+./test-ag-failover.sh verify
+./test-ag-failover.sh adddb
+./test-ag-failover.sh planned
+./test-ag-failover.sh unplanned
+```
+
+Override the SA password if yours differs from the default:
+
+```bash
+SA_PASSWORD='MyPassword!' ./test-ag-failover.sh all
+```
+
+### Health check output
+
+At each state transition the script prints a labelled box showing both layers of the health model side by side:
+
+```
+  ┌─ Pre-planned-failover snapshot
+  │  Pod mssql-ag-0   k8s-ready=true   ag-role=primary
+  │  Pod mssql-ag-1   k8s-ready=true   ag-role=readable-secondary
+  │  Pod mssql-ag-2   k8s-ready=true   ag-role=readable-secondary
+  │
+  │  Replica     Role       SyncHealth  SyncState    LogSendQ_KB  RedoQ_KB
+  │  mssql-ag-0  PRIMARY    HEALTHY     n/a          n/a          n/a
+  │  mssql-ag-1  SECONDARY  HEALTHY     SYNCHRONIZED 0            0
+  │  mssql-ag-2  SECONDARY  HEALTHY     SYNCHRONIZING 0           0
+  └─────────────────────────────────────────────────────────────────────
+```
+
+The K8s layer (pod readiness and `ag-role` label) and the SQL layer (role, sync health, sync state, queue depths) are shown together so you can see at a glance whether any lag exists between what Kubernetes reports and what SQL Server reports.
+
+### What to look for
+
+| Transition | Expected `SyncHealth` | Expected `SyncState` |
+|---|---|---|
+| Initial baseline (empty AG) | `NOT_HEALTHY` | `n/a` — no databases yet |
+| After `ADD DATABASE`, seeding in progress | Primary `HEALTHY`; secondaries `NOT_HEALTHY` | `NOT SYNCHRONIZING` → `SYNCHRONIZING` |
+| After seeding complete | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
+| Immediately after planned `FAILOVER` DDL | Old primary `NOT_HEALTHY` | `n/a` — mid-transition, listener re-pointing |
+| Planned failover settled | All `HEALTHY` | New primary; old primary `SYNCHRONIZED` |
+| After unplanned failover — new primary elected | Crashed pod `NOT_HEALTHY` | `RESOLVING` while SQL Server rejoins |
+| After crashed pod recovered | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
+
+> **Note on the async replica (`mssql-ag-2`):** its steady-state `SyncState` is always `SYNCHRONIZING`, never `SYNCHRONIZED`. This is correct behaviour for `AsynchronousCommit` — the replica continuously applies log as it arrives rather than holding transactions until the secondary acknowledges. The script only waits for the **synchronous** replica to reach `SYNCHRONIZED` before declaring the final health check.
+
 ## API Reference
 
 ### SQLServerInstance spec fields
@@ -331,7 +409,7 @@ ALTER AVAILABILITY GROUP [AG1]
 | T+0 s | Kubelet marks pod `NotReady` (Layer 1 fires) |
 | T+~2 s | Next reconcile detects `NotReady`; `PrimaryNotReadySince` is set; requeue after threshold |
 | T+30 s | Threshold exceeded; best `SynchronousCommit`/`Automatic` replica selected |
-| T+~31 s | `FORCE_FAILOVER_ALLOW_DATA_LOSS` issued on target pod |
+| T+~31 s | `ALTER AVAILABILITY GROUP FAILOVER` issued on target pod |
 | T+~32 s | New primary promoted; `status.primaryReplica` updated; listener Service re-pointed |
 | T+~60 s | Killed pod restarts; re-joins as `RESOLVING` |
 | T+~90 s | Operator issues `SET (ROLE = SECONDARY)`; full synchronization resumes |
