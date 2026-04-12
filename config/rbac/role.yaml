@@ -21,6 +21,7 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - persistentvolumes
   - pods
   verbs:
   - get

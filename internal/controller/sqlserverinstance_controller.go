@@ -51,6 +51,7 @@ type SQLServerInstanceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
 
@@ -84,7 +85,12 @@ func (r *SQLServerInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, fmt.Errorf("could not reconcile Services: %w", err)
 	}
 
-	// --- 4. Update status ---
+	// --- 4. Reconcile PV reclaim policy ---
+	if err := r.reconcilePVCReclaimPolicy(ctx, instance); err != nil {
+		return ctrl.Result{}, fmt.Errorf("could not reconcile PV reclaim policy: %w", err)
+	}
+
+	// --- 5. Update status ---
 	if err := r.updateStatus(ctx, instance); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not update status: %w", err)
 	}
@@ -465,6 +471,47 @@ func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
 		}
 	}
 	*conditions = append(*conditions, cond)
+}
+
+// reconcilePVCReclaimPolicy finds every PVC owned by the instance's StatefulSet and
+// patches the bound PersistentVolume's reclaimPolicy to match spec.storage.reclaimPolicy.
+// This is performed on every reconcile so drift (e.g. a StorageClass default overriding
+// the desired policy) is continuously corrected.
+func (r *SQLServerInstanceReconciler) reconcilePVCReclaimPolicy(ctx context.Context, instance *sqlv1alpha1.SQLServerInstance) error {
+	log := logf.FromContext(ctx)
+	desired := instance.Spec.Storage.ReclaimPolicy
+	if desired == "" {
+		desired = corev1.PersistentVolumeReclaimRetain
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcList,
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels{"app": instance.Name},
+	); err != nil {
+		return fmt.Errorf("could not list PVCs: %w", err)
+	}
+
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName == "" {
+			continue
+		}
+		pv := &corev1.PersistentVolume{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
+			return fmt.Errorf("could not get PV %s: %w", pvc.Spec.VolumeName, err)
+		}
+		if pv.Spec.PersistentVolumeReclaimPolicy == desired {
+			continue
+		}
+		patch := client.MergeFrom(pv.DeepCopy())
+		pv.Spec.PersistentVolumeReclaimPolicy = desired
+		if err := r.Patch(ctx, pv, patch); err != nil {
+			return fmt.Errorf("could not patch PV %s reclaimPolicy: %w", pv.Name, err)
+		}
+		log.Info("Patched PV reclaimPolicy", "pv", pv.Name, "policy", desired)
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

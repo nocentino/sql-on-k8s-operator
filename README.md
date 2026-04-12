@@ -234,6 +234,7 @@ ALTER AVAILABILITY GROUP [AG1]
 | `port` | int32 | `1433` | TCP port SQL Server listens on |
 | `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size for data and log files |
 | `storage.storageClassName` | string | — | StorageClass name (cluster default if omitted) |
+| `storage.reclaimPolicy` | string | `Retain` | PersistentVolume reclaim policy: `Retain` (data preserved after PVC deletion) or `Delete` (PV removed with PVC). The operator patches the bound PV directly so the StorageClass default is overridden. |
 | `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` |
 | `resources` | ResourceRequirements | — | CPU and memory requests/limits |
 | `timezone` | string | — | TZ environment variable for the container |
@@ -252,6 +253,7 @@ ALTER AVAILABILITY GROUP [AG1]
 | `replicas` | []AGReplicaSpec | — | 1–9 replica definitions (see below) |
 | `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size per replica |
 | `storage.storageClassName` | string | — | StorageClass name |
+| `storage.reclaimPolicy` | string | `Retain` | PersistentVolume reclaim policy: `Retain` or `Delete`. Applied to each replica's bound PV. Defaults to `Retain` to protect AG data. |
 | `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` on every replica; `hadr.hadrenabled=1` is always set automatically |
 | `clusterType` | string | `NONE` | AG cluster type: `NONE` (read-scale, manual failover) or `EXTERNAL` (operator-managed, enables automatic failover) |
 | `automaticFailover.enabled` | bool | `true` | Promote a synchronous secondary automatically when the primary is unhealthy (requires `clusterType: EXTERNAL`) |
@@ -390,6 +392,10 @@ kubectl describe pod mssql-standalone-0
 
 # Check PVC binding (pod stuck Pending = unbound PVC)
 kubectl get pvc -l app=mssql-standalone
+
+# Verify the bound PV has the expected reclaimPolicy (should be Retain by default)
+kubectl get pv $(kubectl get pvc mssql-data-mssql-standalone-0 -o jsonpath='{.spec.volumeName}') \
+  -o jsonpath='{.spec.persistentVolumeReclaimPolicy}'
 
 # Check mssql.conf that was applied
 kubectl get configmap mssql-standalone-mssql-conf -o yaml

@@ -38,6 +38,7 @@ spec:
       readableSecondary: true
   storage:
     dataVolumeSize: "20Gi"
+    reclaimPolicy: Retain
   mssqlConf:
     "sqlagent.enabled": "true"
   # Read-write listener: always points at the current PRIMARY replica.

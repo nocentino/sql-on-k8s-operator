@@ -18,6 +18,7 @@ spec:
   serviceType: LoadBalancer
   storage:
     dataVolumeSize: "10Gi"
+    reclaimPolicy: Retain
   mssqlConf:
     "sqlagent.enabled": "true"
   resources:

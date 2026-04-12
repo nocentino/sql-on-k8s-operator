@@ -368,6 +368,19 @@ spec:
                       data and log files.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  reclaimPolicy:
+                    default: Retain
+                    description: |-
+                      ReclaimPolicy controls what happens to the underlying PersistentVolume when the
+                      PVC is deleted. The operator patches the bound PV's reclaimPolicy to match this
+                      field on every reconcile, overriding the StorageClass default.
+                        Retain  — PV is kept after the PVC is deleted; data is preserved for manual recovery.
+                        Delete  — PV and its backing storage are deleted together with the PVC.
+                      Defaults to Retain to protect SQL Server data from accidental loss.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
                   storageClassName:
                     description: StorageClassName is the name of the StorageClass
                       to use (e.g. standard, managed-csi).

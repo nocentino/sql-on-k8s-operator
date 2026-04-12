@@ -90,6 +90,8 @@ const (
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch;patch
 
 // Reconcile drives the desired state of a SQLServerAvailabilityGroup.
 func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -173,6 +175,11 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 		if err := r.reconcileResolvingReplicas(ctx, ag); err != nil {
 			log.Error(err, "Could not reconcile RESOLVING replicas; will retry on next poll")
 		}
+	}
+
+	// 9. Reconcile PV reclaim policy for all replica PVCs.
+	if err := r.reconcilePVCReclaimPolicy(ctx, ag); err != nil {
+		return ctrl.Result{}, fmt.Errorf("could not reconcile PV reclaim policy: %w", err)
 	}
 
 	// Requeue periodically to keep status fresh and detect failovers
@@ -1486,6 +1493,47 @@ func (r *SQLServerAvailabilityGroupReconciler) mapPodToAG(ctx context.Context, o
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: agName, Namespace: obj.GetNamespace()}}}
+}
+
+// reconcilePVCReclaimPolicy lists all PVCs for the AG's replicas (matched by the
+// "app: <agName>" label the StatefulSet applies), then patches each bound PV's
+// reclaimPolicy to match spec.storage.reclaimPolicy. Defaults to Retain when the
+// field is unset so data is never silently deleted on CR removal.
+func (r *SQLServerAvailabilityGroupReconciler) reconcilePVCReclaimPolicy(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
+	log := logf.FromContext(ctx)
+	desired := ag.Spec.Storage.ReclaimPolicy
+	if desired == "" {
+		desired = corev1.PersistentVolumeReclaimRetain
+	}
+
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcList,
+		client.InNamespace(ag.Namespace),
+		client.MatchingLabels{"app": ag.Name},
+	); err != nil {
+		return fmt.Errorf("could not list PVCs: %w", err)
+	}
+
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName == "" {
+			continue
+		}
+		pv := &corev1.PersistentVolume{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
+			return fmt.Errorf("could not get PV %s: %w", pvc.Spec.VolumeName, err)
+		}
+		if pv.Spec.PersistentVolumeReclaimPolicy == desired {
+			continue
+		}
+		patch := client.MergeFrom(pv.DeepCopy())
+		pv.Spec.PersistentVolumeReclaimPolicy = desired
+		if err := r.Patch(ctx, pv, patch); err != nil {
+			return fmt.Errorf("could not patch PV %s reclaimPolicy: %w", pv.Name, err)
+		}
+		log.Info("Patched PV reclaimPolicy", "pv", pv.Name, "policy", desired)
+	}
+	return nil
 }
 
 // SetupWithManager sets up the AG controller with the Manager.

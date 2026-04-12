@@ -100,6 +100,17 @@ type SQLServerStorageSpec struct {
 	// +kubebuilder:default={"ReadWriteOnce"}
 	// +optional
 	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+
+	// ReclaimPolicy controls what happens to the underlying PersistentVolume when the
+	// PVC is deleted. The operator patches the bound PV's reclaimPolicy to match this
+	// field on every reconcile, overriding the StorageClass default.
+	//   Retain  — PV is kept after the PVC is deleted; data is preserved for manual recovery.
+	//   Delete  — PV and its backing storage are deleted together with the PVC.
+	// Defaults to Retain to protect SQL Server data from accidental loss.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +kubebuilder:default=Retain
+	// +optional
+	ReclaimPolicy corev1.PersistentVolumeReclaimPolicy `json:"reclaimPolicy,omitempty"`
 }
 
 // SQLServerInstanceStatus defines the observed state of SQLServerInstance.
