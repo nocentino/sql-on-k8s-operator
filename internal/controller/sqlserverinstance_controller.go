@@ -249,12 +249,22 @@ func (r *SQLServerInstanceReconciler) buildStatefulSet(instance *sqlv1alpha1.SQL
 		acceptEULA = "Y"
 	}
 
-	// Build environment variables
+	// Build environment variables.
+	// Both SA_PASSWORD (legacy) and MSSQL_SA_PASSWORD (current) are set from the
+	// same secret so the image works regardless of SQL Server version. Microsoft
+	// deprecated SA_PASSWORD starting with SQL Server 2019 CU; MSSQL_SA_PASSWORD
+	// is the preferred name going forward.
 	envVars := []corev1.EnvVar{
 		{Name: "ACCEPT_EULA", Value: acceptEULA},
 		{Name: "MSSQL_PID", Value: edition},
 		{
 			Name: "SA_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &instance.Spec.SAPasswordSecretRef,
+			},
+		},
+		{
+			Name: "MSSQL_SA_PASSWORD",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &instance.Spec.SAPasswordSecretRef,
 			},
@@ -294,6 +304,12 @@ func (r *SQLServerInstanceReconciler) buildStatefulSet(instance *sqlv1alpha1.SQL
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
+					// fsGroup 10001 is the mssql group; required so the SQL Server
+					// process can read/write data files on the mounted PVC volume.
+					// See: https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-kubernetes-best-practices-statefulsets
+					SecurityContext: &corev1.PodSecurityContext{
+						FSGroup: func() *int64 { g := int64(10001); return &g }(),
+					},
 					NodeSelector: instance.Spec.NodeSelector,
 					Tolerations:  instance.Spec.Tolerations,
 					Containers: []corev1.Container{
@@ -314,7 +330,7 @@ func (r *SQLServerInstanceReconciler) buildStatefulSet(instance *sqlv1alpha1.SQL
 									Exec: &corev1.ExecAction{
 										Command: []string{
 											"/bin/bash", "-c",
-											`/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`,
+											`/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`,
 										},
 									},
 								},
@@ -328,7 +344,7 @@ func (r *SQLServerInstanceReconciler) buildStatefulSet(instance *sqlv1alpha1.SQL
 									Exec: &corev1.ExecAction{
 										Command: []string{
 											"/bin/bash", "-c",
-											`/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`,
+											`/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`,
 										},
 									},
 								},
