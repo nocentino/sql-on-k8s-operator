@@ -25,28 +25,24 @@ import (
 // clusterTypeNone is the SQL Server cluster type for standalone AG (no Pacemaker/WSFC).
 const clusterTypeNone = "NONE"
 
-// PlannedFailoverSQL returns the T-SQL to perform a clean, no-data-loss planned failover
-// on the current replica. The replica becomes the new PRIMARY without any data loss
-// provided the target was SYNCHRONIZED with the old primary before the command was issued.
+// FailoverSQL returns the T-SQL to promote the current replica to PRIMARY.
 //
-// This command is only valid with CLUSTER_TYPE = EXTERNAL. The sp_set_session_context call
-// is required by SQL Server to authorize the operator as the external cluster manager (Msg 47104
-// is returned if it is absent).
-func PlannedFailoverSQL(agName string) string {
+// Used for both planned and unplanned failover. With CLUSTER_TYPE = EXTERNAL, SQL Server
+// persists each replica's synchronization state locally, so ALTER AVAILABILITY GROUP FAILOVER
+// succeeds on a synchronized secondary even when the primary is offline — SQL Server verifies
+// from its local copy of the AG configuration that the replica had received every committed
+// transaction. If the replica is not synchronized, SQL Server rejects the command with
+// error 41142; the operator logs the rejection and retries on the next reconcile cycle.
+//
+// This mirrors the promote action in Microsoft's mssql-server-ha ag-helper, which always
+// issues ALTER AVAILABILITY GROUP FAILOVER and surfaces error 41142 back to Pacemaker
+// rather than falling back to FORCE_FAILOVER_ALLOW_DATA_LOSS.
+//
+// The sp_set_session_context call is required when CLUSTER_TYPE = EXTERNAL to authorize
+// the operator as the external cluster manager (Msg 47104 is returned if it is absent).
+func FailoverSQL(agName string) string {
 	return fmt.Sprintf(
 		"EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes';\nALTER AVAILABILITY GROUP [%s] FAILOVER;",
-		agName)
-}
-
-// ForcedFailoverSQL returns the T-SQL to perform a forced failover on the current replica.
-// Used for unplanned failover when the primary is unreachable. For a synchronous replica
-// that was SYNCHRONIZED at the time of the primary failure, no data is actually lost.
-//
-// The sp_set_session_context call is required by SQL Server when CLUSTER_TYPE = EXTERNAL
-// to authorize the operator as the external cluster manager (Msg 47104 is returned if absent).
-func ForcedFailoverSQL(agName string) string {
-	return fmt.Sprintf(
-		"EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes';\nALTER AVAILABILITY GROUP [%s] FORCE_FAILOVER_ALLOW_DATA_LOSS;",
 		agName)
 }
 

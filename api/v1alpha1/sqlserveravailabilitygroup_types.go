@@ -67,6 +67,25 @@ type AutomaticFailoverSpec struct {
 	// +kubebuilder:default=30
 	// +kubebuilder:validation:Minimum=10
 	FailoverThresholdSeconds int32 `json:"failoverThresholdSeconds,omitempty"`
+
+	// HealthThreshold controls how sensitive the automatic failover is to SQL Server
+	// internal health degradation detected by sp_server_diagnostics, independently of
+	// whether the pod itself is Kubernetes-Ready. Matches Microsoft's mssql-server-ha
+	// health level constants:
+	//
+	//   system           — trigger only on OS/scheduler-level errors (default; equivalent
+	//                      to Microsoft's ServerCriticalError threshold)
+	//   resource         — also trigger on buffer-pool/memory-pressure errors
+	//   query_processing — also trigger on worker-deadlock/long-running-query errors
+	//                      (most sensitive; equivalent to ServerAnyQualifiedError)
+	//
+	// When the primary pod is K8s-Ready but sp_server_diagnostics reports a failure at
+	// or beyond this threshold, the operator treats the pod as degraded and starts the
+	// failover timer just as if the pod had become NotReady.
+	// +kubebuilder:default=system
+	// +kubebuilder:validation:Enum=system;resource;query_processing
+	// +optional
+	HealthThreshold string `json:"healthThreshold,omitempty"`
 }
 
 // AGReplicaSpec defines the desired state of one AG replica.

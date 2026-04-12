@@ -205,7 +205,8 @@ spec:
 | `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` on every replica; `hadr.hadrenabled=1` is always set automatically |
 | `clusterType` | string | `NONE` | AG cluster type: `NONE` (read-scale, manual failover) or `EXTERNAL` (operator-managed, enables automatic failover) |
 | `automaticFailover.enabled` | bool | `true` | Promote a synchronous secondary automatically when the primary is unhealthy (requires `clusterType: EXTERNAL`) |
-| `automaticFailover.failoverThresholdSeconds` | int32 | `30` | Seconds the primary must be continuously NotReady before an automatic failover is triggered (minimum 10) |
+| `automaticFailover.failoverThresholdSeconds` | int32 | `30` | Seconds the primary must be continuously unhealthy before an automatic failover is triggered (minimum 10) |
+| `automaticFailover.healthThreshold` | string | `system` | SQL Server internal health sensitivity: `system` (default), `resource`, or `query_processing` — see [Automatic Failover](#automatic-failover) |
 | `listener` | ListenerSpec | — | Read-write Service pointing at the current PRIMARY |
 | `readOnlyListener` | ListenerSpec | — | Read-only Service pointing at readable SECONDARY replicas |
 | `resources` | ResourceRequirements | — | CPU and memory requests/limits per replica |
@@ -229,6 +230,111 @@ spec:
 | `primaryReplica` | string | Pod name of the current PRIMARY replica |
 | `phase` | string | Overall lifecycle phase |
 | `replicaStatuses` | []AGReplicaStatus | Per-replica role, synchronization state, and connectivity |
+
+## Automatic Failover
+
+Automatic failover is active when `clusterType: EXTERNAL` and `automaticFailover.enabled: true`. The operator acts as the external cluster manager, replacing Pacemaker in a Kubernetes-native way.
+
+### Two-layer health model
+
+The operator uses two independent signals to decide whether the primary is healthy. Together they cover every real-world failure mode.
+
+**Layer 1 — Kubernetes pod readiness (process-level)**
+
+The kubelet continuously evaluates the readiness probe on each pod. When the primary pod transitions to `Ready=False` (crash, OOMKill, failed probe), the operator starts the `failoverThresholdSeconds` countdown timer. This is the primary liveness signal and carries zero SQL overhead — the kubelet owns it.
+
+**Layer 2 — `sp_server_diagnostics` (SQL-internal health)**
+
+On every reconcile the operator runs `EXEC sp_server_diagnostics` directly inside the primary pod via `kubectl exec`. This mirrors the `OpenDBWithHealthCheck` + `QueryDiagnostics` pattern in Microsoft's [mssql-server-ha](https://github.com/microsoft/mssql-server-ha) Pacemaker resource agent. It catches SQL Server internal failures that don't immediately crash the process — and therefore don't flip the pod to `NotReady`:
+
+| `sp_server_diagnostics` component | What it detects |
+|---|---|
+| `system` | Non-yielding schedulers, OS-level errors |
+| `resource` | Buffer pool exhaustion, out-of-memory pressure |
+| `query_processing` | Deadlocked worker threads, runaway queries |
+
+When the primary pod **is** `Ready` but `sp_server_diagnostics` reports a failure at or beyond the configured `healthThreshold`, the operator treats the pod as degraded and starts the same failover timer — exactly as if the pod had become `NotReady`.
+
+**Why both layers are needed:**
+
+| Failure scenario | K8s Ready | `sp_server_diagnostics` | Detected by |
+|---|---|---|---|
+| Pod crash / OOMKill | → NotReady | exec fails | Layer 1 |
+| SQL process killed | → NotReady | exec fails | Layer 1 |
+| Non-yielding scheduler | → Ready | `system` = error | Layer 2 |
+| Memory pressure | → Ready | `resource` = error | Layer 2 |
+| Worker deadlock | → Ready | `query_processing` = error | Layer 2 |
+
+If `sp_server_diagnostics` cannot be reached (exec error, SQL temporarily slow), the operator treats the result conservatively as healthy. Layer 1 remains the authority for true liveness failures.
+
+### `healthThreshold` configuration
+
+The `healthThreshold` field maps directly to the component hierarchy checked by `sp_server_diagnostics`. It controls how deep the health check descends before declaring the primary degraded:
+
+| Value | Trigger condition | Equivalent Microsoft constant |
+|---|---|---|
+| `system` (default) | `system` component in error state | `ServerCriticalError` |
+| `resource` | `system` **or** `resource` in error state | `ServerModerateError` |
+| `query_processing` | `system`, `resource`, **or** `query_processing` in error state | `ServerAnyQualifiedError` |
+
+Example — increase sensitivity to memory pressure:
+
+```yaml
+spec:
+  clusterType: EXTERNAL
+  automaticFailover:
+    enabled: true
+    failoverThresholdSeconds: 30
+    healthThreshold: resource
+```
+
+### Replica selection
+
+When a failover is triggered the operator selects the best available synchronous secondary:
+
+1. Only replicas configured with `availabilityMode: SynchronousCommit` and `failoverMode: Automatic` are candidates (asynchronous replicas are never auto-promoted).
+2. The controller queries `synchronization_health_desc` on each candidate. A replica reporting `HEALTHY` is preferred.
+3. If no candidate reports `HEALTHY` — which is normal when the primary crashed suddenly, because `sys.dm_hadr_database_replica_states` reports `NOT SYNCHRONIZING` even for replicas that were fully synchronized at the moment of the crash — the operator falls back to the first `SynchronousCommit`/`Automatic` replica it can reach.
+
+This matches the behaviour documented in Microsoft's source:
+> *"If the PRIMARY is down, all DB replicas report themselves as NOT SYNCHRONIZING in `sys.dm_hadr_database_replica_states` even if their copy of the AG configuration indicates they were synchronized before the PRIMARY went down."*
+
+### Failover DDL and external cluster authorization
+
+With `CLUSTER_TYPE = EXTERNAL`, SQL Server requires the cluster manager to identify itself before issuing any failover DDL. The operator sets the session context before every failover command:
+
+```sql
+EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes';
+ALTER AVAILABILITY GROUP [AG1] FAILOVER;
+```
+
+This is the same DDL for both planned and unplanned failover. It directly mirrors the promote action in Microsoft's [mssql-server-ha](https://github.com/microsoft/mssql-server-ha) ag-helper, which always issues `ALTER AVAILABILITY GROUP FAILOVER` — never `FORCE_FAILOVER_ALLOW_DATA_LOSS`.
+
+With `CLUSTER_TYPE = EXTERNAL`, SQL Server persists each replica's synchronization state locally. When the primary is offline, a secondary can issue `FAILOVER` and SQL Server verifies from its local copy of the AG configuration that the replica had received every committed transaction. If the replica was not synchronized, SQL Server rejects the command with **error 41142** rather than risking data loss. The operator logs the rejection and retries on the next reconcile cycle, trying a different candidate if available.
+
+`FORCE_FAILOVER_ALLOW_DATA_LOSS` is never used by this operator.
+
+### RESOLVING → SECONDARY after failover
+
+After an unplanned failover, the evicted primary pod restarts. With `CLUSTER_TYPE = EXTERNAL`, SQL Server leaves a restarted replica in `RESOLVING` state indefinitely — it waits for the external cluster manager to explicitly assign its role. On every reconcile the operator queries the current primary for any `RESOLVING` replicas and promotes them back to `SECONDARY`:
+
+```sql
+ALTER AVAILABILITY GROUP [AG1]
+  MODIFY REPLICA ON N'<pod-fqdn>' WITH (ROLE = SECONDARY);
+```
+
+### Typical unplanned failover timeline
+
+| Time | Event |
+|---|---|
+| T+0 s | Primary pod is killed / crashes |
+| T+0 s | Kubelet marks pod `NotReady` (Layer 1 fires) |
+| T+~2 s | Next reconcile detects `NotReady`; `PrimaryNotReadySince` is set; requeue after threshold |
+| T+30 s | Threshold exceeded; best `SynchronousCommit`/`Automatic` replica selected |
+| T+~31 s | `FORCE_FAILOVER_ALLOW_DATA_LOSS` issued on target pod |
+| T+~32 s | New primary promoted; `status.primaryReplica` updated; listener Service re-pointed |
+| T+~60 s | Killed pod restarts; re-joins as `RESOLVING` |
+| T+~90 s | Operator issues `SET (ROLE = SECONDARY)`; full synchronization resumes |
 
 ## Uninstall
 

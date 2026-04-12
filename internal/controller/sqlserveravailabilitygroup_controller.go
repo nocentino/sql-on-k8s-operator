@@ -1051,9 +1051,10 @@ func isPodReady(pod *corev1.Pod) bool {
 //     This guarantees zero data loss for synchronous-commit replicas.
 //  2. If no HEALTHY replica is found (e.g. primary just died and secondaries are still
 //     transitioning, or SQL Server is temporarily unresponsive), fall back to the first
-//     configured SynchronousCommit/Automatic replica. The FORCE_FAILOVER_ALLOW_DATA_LOSS
-//     command on a synchronous replica that was SYNCHRONIZED before the primary died incurs
-//     no actual data loss despite the command name.
+//     configured SynchronousCommit/Automatic replica. SQL Server will accept FAILOVER on
+//     a synchronized replica even when the primary is offline (it checks the persisted
+//     synchronization state). If the replica was not synchronized, SQL Server returns
+//     error 41142 and the operator retries on the next reconcile.
 //
 // A replica is considered for either pass only when:
 //   - AvailabilityMode = SynchronousCommit — async replicas are never auto-failed over to.
@@ -1063,8 +1064,8 @@ func isPodReady(pod *corev1.Pod) bool {
 // primary failure, secondaries may be temporarily unresponsive to SELECT 1 (e.g. RESOLVING
 // state transitions, redo thread activity, or transient kubelet exec latency). Skipping them
 // entirely would leave the AG in a headless state indefinitely. Instead, we capture them as
-// best-effort candidates and let the subsequent FORCE_FAILOVER_ALLOW_DATA_LOSS command fail
-// and retry until the target is ready to accept commands.
+// best-effort candidates and let the subsequent FAILOVER command retry until the target
+// is ready to accept commands (or SQL Server rejects with 41142 if not synchronized).
 //
 // NOTE: synchronization_state_desc (SYNCHRONIZED/SYNCHRONIZING) lives in
 // sys.dm_hadr_DATABASE_replica_states, not sys.dm_hadr_availability_replica_states.
@@ -1093,7 +1094,7 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 
 		// Check replica-level synchronization health.
 		// If the check fails (SQL Server temporarily unreachable), keep the candidate as
-		// best-effort rather than skipping it entirely. The FORCE_FAILOVER command will be
+		// best-effort rather than skipping it entirely. The FAILOVER command will be
 		// retried and will succeed once the target's SQL Server is ready to accept commands.
 		health, hErr := exec.GetAGSyncState(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
 		if hErr != nil {
@@ -1179,14 +1180,19 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 	return nil
 }
 
-// forceFailoverHeadlessAG handles the "headless AG" scenario: the recorded primary pod
+// failoverHeadlessAG handles the "headless AG" scenario: the recorded primary pod
 // is K8s-Ready but is serving as SECONDARY/RESOLVING (e.g. after an unplanned kill +
 // pod restart), leaving the AG with no active primary.
 //
+// Issues ALTER AVAILABILITY GROUP FAILOVER (not FORCE_FAILOVER_ALLOW_DATA_LOSS) on the
+// best synchronous secondary. SQL Server verifies synchronization state locally and rejects
+// the command with error 41142 if the target was not synchronized; the operator retries on
+// the next reconcile rather than forcing a potentially lossy failover.
+//
 // Returns a non-empty ctrl.Result when it handled the situation (corrected status, issued
-// force failover, or queued a retry). Returns ctrl.Result{} when the pod is genuinely
+// failover, or queued a retry). Returns ctrl.Result{} when the pod is genuinely
 // serving as PRIMARY (or SQL is unreachable — we treat that conservatively as healthy).
-func (r *SQLServerAvailabilityGroupReconciler) forceFailoverHeadlessAG(
+func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 	ctx context.Context,
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
 	primaryPodName string,
@@ -1224,8 +1230,8 @@ func (r *SQLServerAvailabilityGroupReconciler) forceFailoverHeadlessAG(
 		}
 	}
 
-	// No pod is PRIMARY — the AG is headless. Trigger immediate force failover.
-	log.Info("AG is headless (no primary); triggering immediate force failover",
+	// No pod is PRIMARY — the AG is headless. Trigger immediate failover.
+	log.Info("AG is headless (no primary); triggering immediate failover",
 		"recordedPrimary", primaryPodName)
 
 	targetPod, selErr := r.selectFailoverTarget(ctx, ag)
@@ -1234,13 +1240,18 @@ func (r *SQLServerAvailabilityGroupReconciler) forceFailoverHeadlessAG(
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	if _, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
-		sqlutil.ForcedFailoverSQL(ag.Spec.AGName)); foErr != nil {
-		log.Error(foErr, "Forced failover command failed for headless AG; will retry", "target", targetPod)
+	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
+		sqlutil.FailoverSQL(ag.Spec.AGName))
+	if foErr != nil {
+		if isUnsynchronizedError(foRes, foErr) {
+			log.Info("Failover target not synchronized (error 41142); will retry", "target", targetPod)
+		} else {
+			log.Error(foErr, "Failover command failed for headless AG; will retry", "target", targetPod)
+		}
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	log.Info("Headless AG force failover succeeded", "newPrimary", targetPod, "formerPrimary", primaryPodName)
+	log.Info("Headless AG failover succeeded", "newPrimary", targetPod, "formerPrimary", primaryPodName)
 	now := metav1.Now()
 	ag.Status.PrimaryReplica = targetPod
 	ag.Status.PrimaryNotReadySince = nil
@@ -1259,20 +1270,83 @@ func (r *SQLServerAvailabilityGroupReconciler) forceFailoverHeadlessAG(
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
+// isUnsynchronizedError returns true when a failover exec result contains SQL Server
+// error 41142, which indicates the target replica was not synchronized with the primary
+// at the time of the failover and SQL Server rejected the FAILOVER command rather than
+// risking data loss. The operator retries on the next reconcile cycle.
+//
+// This matches Microsoft's mssql-server-ha behaviour: ag-helper checks for this error
+// and returns OCF_ERR_GENERIC to Pacemaker, never falling back to FORCE_FAILOVER.
+func isUnsynchronizedError(res sqlutil.ExecResult, err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(res.Stdout, "41142") ||
+		strings.Contains(err.Error(), "41142")
+}
+
+// primaryDiagsUnhealthy runs sp_server_diagnostics on the named pod and returns true
+// when the instance health fails the configured HealthThreshold. It matches Microsoft's
+// OpenDBWithHealthCheck + Diagnose pattern from mssql-server-ha.
+//
+// Returns false (healthy) in all error cases — if SQL Server is genuinely unreachable,
+// the Kubernetes pod readiness probe will catch it and set the pod to NotReady, which
+// is the primary liveness signal for the failover timer.
+func (r *SQLServerAvailabilityGroupReconciler) primaryDiagsUnhealthy(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	podName string,
+) bool {
+	log := logf.FromContext(ctx)
+
+	threshold := "system" // matches Microsoft's default ServerCriticalError
+	if ag.Spec.AutomaticFailover != nil && ag.Spec.AutomaticFailover.HealthThreshold != "" {
+		threshold = ag.Spec.AutomaticFailover.HealthThreshold
+	}
+
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		log.Info("Could not retrieve SA password for diagnostics check; treating as healthy", "err", err)
+		return false
+	}
+
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+	diag, err := exec.CheckServerDiagnostics(ctx, ag.Namespace, podName, "mssql", saPassword)
+	if err != nil {
+		// SQL Server temporarily unreachable — treat conservatively as healthy.
+		// The K8s readiness probe will flip the pod to NotReady if it truly fails.
+		log.Info("Could not run sp_server_diagnostics; treating primary as healthy", "pod", podName, "err", err)
+		return false
+	}
+
+	healthy := diag.IsHealthyAt(threshold)
+	if !healthy {
+		log.Info("sp_server_diagnostics reports primary unhealthy",
+			"pod", podName,
+			"threshold", threshold,
+			"system", diag.System,
+			"resource", diag.Resource,
+			"queryProcessing", diag.QueryProcessing)
+	}
+	return !healthy
+}
+
 // reconcileFailover detects primary pod failures and automatically promotes a synchronous
 // secondary. It is a no-op unless AutomaticFailover is enabled.
 //
 // With CLUSTER_TYPE = EXTERNAL the operator acts as the external cluster manager and issues
-// FORCE_FAILOVER_ALLOW_DATA_LOSS (prefixed with sp_set_session_context to authorize the DDL).
-// For a synchronous replica that was SYNCHRONIZED at the time of the primary failure, no
-// data is actually lost despite the command name.
+// ALTER AVAILABILITY GROUP FAILOVER (prefixed with sp_set_session_context to authorize the DDL).
+// This mirrors the promote action in Microsoft's mssql-server-ha ag-helper, which always
+// issues FAILOVER and surfaces error 41142 back to Pacemaker if the target is not synchronized,
+// rather than falling back to FORCE_FAILOVER_ALLOW_DATA_LOSS.
 //
 // State machine:
 //  1. Primary pod is Ready           → clear PrimaryNotReadySince, return.
 //  2. Primary pod is NotReady        → record PrimaryNotReadySince (first observation), requeue.
 //  3. NotReady for < threshold       → wait, requeue with remaining time.
-//  4. NotReady for >= threshold      → select best synchronous target, issue FORCE_FAILOVER,
+//  4. NotReady for >= threshold      → select best synchronous target, issue FAILOVER,
 //     update status.PrimaryReplica and clear PrimaryNotReadySince.
+//     If target returns 41142 (not synchronized), log and retry next reconcile.
 func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -1295,23 +1369,37 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 	patch := client.MergeFrom(ag.DeepCopy())
 
 	if podReady {
-		// The primary pod is K8s-Ready, but it may have restarted after being killed and
-		// come back as SECONDARY/RESOLVING, leaving the AG with no active primary ("headless
-		// AG"). forceFailoverHeadlessAG detects this via SQL and issues an immediate force
-		// failover without waiting for the NotReady timer.
-		if result, hErr := r.forceFailoverHeadlessAG(ctx, ag, primaryPodName, patch); hErr != nil || result != (ctrl.Result{}) {
-			return result, hErr
-		}
-
-		// Pod is genuinely serving as PRIMARY (or SQL is unreachable — treated conservatively).
-		if ag.Status.PrimaryNotReadySince != nil {
-			log.Info("Primary pod recovered; clearing failover timer", "pod", primaryPodName)
-			ag.Status.PrimaryNotReadySince = nil
-			if err := r.Status().Patch(ctx, ag, patch); err != nil {
-				return ctrl.Result{}, fmt.Errorf("could not clear PrimaryNotReadySince: %w", err)
+		// Supplementary SQL Server health check via sp_server_diagnostics.
+		// Catches internal failures (non-yielding schedulers, memory pressure, worker
+		// deadlocks) that don't immediately flip the pod to K8s-NotReady — matching
+		// Microsoft's OpenDBWithHealthCheck + Diagnose pattern from mssql-server-ha.
+		//
+		// Conservative: if the exec fails (SQL temporarily unreachable), we treat the
+		// pod as healthy and let the K8s readiness probe handle the real liveness signal.
+		if r.primaryDiagsUnhealthy(ctx, ag, primaryPodName) {
+			// Pod is K8s-Ready but SQL Server internally unhealthy — fall through to
+			// the NotReady timer logic below so the same threshold/timer path is used.
+			log.Info("Primary is K8s-Ready but sp_server_diagnostics reports unhealthy; treating as degraded",
+				"pod", primaryPodName)
+		} else {
+			// The primary pod is K8s-Ready AND SQL is healthy, but it may have restarted
+			// after being killed and come back as SECONDARY/RESOLVING, leaving the AG with
+			// no active primary ("headless AG"). failoverHeadlessAG detects this via SQL
+			// and issues an immediate failover without waiting for the NotReady timer.
+			if result, hErr := r.failoverHeadlessAG(ctx, ag, primaryPodName, patch); hErr != nil || result != (ctrl.Result{}) {
+				return result, hErr
 			}
+
+			// Pod is genuinely serving as PRIMARY (or SQL is unreachable — treated conservatively).
+			if ag.Status.PrimaryNotReadySince != nil {
+				log.Info("Primary pod recovered; clearing failover timer", "pod", primaryPodName)
+				ag.Status.PrimaryNotReadySince = nil
+				if err := r.Status().Patch(ctx, ag, patch); err != nil {
+					return ctrl.Result{}, fmt.Errorf("could not clear PrimaryNotReadySince: %w", err)
+				}
+			}
+			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, nil
 	}
 
 	// Primary is NotReady (or missing).
@@ -1354,9 +1442,14 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 		return ctrl.Result{}, err
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
-	if _, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
-		sqlutil.ForcedFailoverSQL(ag.Spec.AGName)); foErr != nil {
-		log.Error(foErr, "Forced failover command failed; will retry", "target", targetPod)
+	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
+		sqlutil.FailoverSQL(ag.Spec.AGName))
+	if foErr != nil {
+		if isUnsynchronizedError(foRes, foErr) {
+			log.Info("Failover target not synchronized (error 41142); will retry with another candidate next reconcile", "target", targetPod)
+		} else {
+			log.Error(foErr, "Failover command failed; will retry", "target", targetPod)
+		}
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 

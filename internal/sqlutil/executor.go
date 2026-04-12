@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -91,6 +92,94 @@ func (e *Executor) ExecSQL(ctx context.Context, namespace, podName, containerNam
 			result.Stdout, result.Stderr, err)
 	}
 	return result, nil
+}
+
+// ServerDiagnostics holds the per-component health reported by sp_server_diagnostics.
+// A true value means the component is healthy (state != 3/error).
+// Matches the Diagnostics struct in Microsoft's mssql-server-ha mssqlcommon package.
+type ServerDiagnostics struct {
+	System          bool // OS schedulers, CPU, memory allocator
+	Resource        bool // Buffer pool, out-of-memory conditions
+	QueryProcessing bool // Deadlocked workers, long-running queries
+}
+
+// IsHealthyAt returns true when the diagnostics pass the given threshold, where threshold
+// is one of "system", "resource", or "query_processing". The semantics match Microsoft's
+// health level constants (ServerCriticalError, ServerModerateError, ServerAnyQualifiedError):
+//
+//   - "system"           → only system errors cause unhealthy (default, least sensitive)
+//   - "resource"         → system or resource errors cause unhealthy
+//   - "query_processing" → system, resource, or query-processing errors cause unhealthy
+func (d ServerDiagnostics) IsHealthyAt(threshold string) bool {
+	switch threshold {
+	case "query_processing":
+		return d.System && d.Resource && d.QueryProcessing
+	case "resource":
+		return d.System && d.Resource
+	default: // "system"
+		return d.System
+	}
+}
+
+// CheckServerDiagnostics runs EXEC sp_server_diagnostics on the named pod and returns
+// the per-component health state. This is the Kubernetes-native equivalent of the
+// OpenDBWithHealthCheck + QueryDiagnostics pattern used in Microsoft's mssql-server-ha
+// ag-helper binary.
+//
+// The query captures the stored procedure output into a table variable and extracts
+// just the component_name and state columns to keep sqlcmd output easy to parse.
+// state = 3 means error for a component; other values (1=clean, 2=warning) are healthy.
+//
+// If the stored procedure cannot be reached (SQL Server down, exec failure), an error
+// is returned. Callers should treat exec errors conservatively (assume healthy) so that
+// the Kubernetes pod readiness probe — which also connects to SQL — remains the primary
+// liveness signal.
+func (e *Executor) CheckServerDiagnostics(ctx context.Context, namespace, podName, containerName, saPassword string) (ServerDiagnostics, error) {
+	const query = `SET NOCOUNT ON;
+DECLARE @diag TABLE (
+    creation_time  NVARCHAR(50),
+    component_type NVARCHAR(50),
+    component_name NVARCHAR(100),
+    state          INT,
+    state_desc     NVARCHAR(50),
+    data           XML
+);
+INSERT INTO @diag EXEC sp_server_diagnostics;
+SELECT component_name + '|' + CAST(state AS NVARCHAR(5))
+FROM   @diag
+WHERE  component_name IN ('system', 'resource', 'query_processing');`
+
+	res, err := e.ExecSQL(ctx, namespace, podName, containerName, saPassword, query)
+	if err != nil {
+		return ServerDiagnostics{}, err
+	}
+
+	// sp_server_diagnostics state values: 1=clean, 2=warning, 3=error.
+	const stateError = 3
+
+	// All components default to healthy; only flip to false when state = 3.
+	diag := ServerDiagnostics{System: true, Resource: true, QueryProcessing: true}
+	for line := range strings.SplitSeq(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		state, parseErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if parseErr != nil {
+			continue
+		}
+		switch name {
+		case "system":
+			diag.System = state != stateError
+		case "resource":
+			diag.Resource = state != stateError
+		case "query_processing":
+			diag.QueryProcessing = state != stateError
+		}
+	}
+	return diag, nil
 }
 
 // IsReady returns true when a SELECT 1 query succeeds, indicating SQL Server is up.
