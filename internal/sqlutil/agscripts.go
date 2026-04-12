@@ -72,6 +72,27 @@ WHERE ag.name = '%s'
   AND rs.role_desc = 'RESOLVING';`, agName)
 }
 
+// NotSynchronizingReplicasSQL returns a query that lists the replica_server_name
+// of every non-local SECONDARY replica that has at least one database in
+// NOT SYNCHRONIZING state, as seen from the primary.
+//
+// With CLUSTER_TYPE = EXTERNAL, after a planned or unplanned failover the
+// secondaries that were connected to the old primary sometimes lose database
+// sync with the new primary. Re-issuing SET (ROLE = SECONDARY) on those
+// replicas forces them to re-establish the database mirroring session.
+func NotSynchronizingReplicasSQL(agName string) string {
+	return fmt.Sprintf(`SET NOCOUNT ON;
+SELECT DISTINCT ar.replica_server_name
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states rs ON ar.replica_id = rs.replica_id
+JOIN sys.dm_hadr_database_replica_states drs ON rs.replica_id = drs.replica_id
+WHERE ag.name = '%s'
+  AND rs.is_local = 0
+  AND rs.role_desc = 'SECONDARY'
+  AND drs.synchronization_state_desc = 'NOT SYNCHRONIZING';`, agName)
+}
+
 // SyncReplicaStatesSQL returns a query that yields one row per non-local replica with:
 //   - replica_name  : the short pod hostname (@@SERVERNAME on that pod)
 //   - avail_mode    : SYNCHRONOUS_COMMIT or ASYNCHRONOUS_COMMIT

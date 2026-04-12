@@ -177,6 +177,18 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 		}
 	}
 
+	// 8b. NOT SYNCHRONIZING replica detection (CLUSTER_TYPE = EXTERNAL only).
+	// After a planned or unplanned failover, secondaries that were connected to the
+	// old primary sometimes lose database synchronization with the new primary. Their
+	// replica role is SECONDARY but their databases are stuck in NOT SYNCHRONIZING state.
+	// Re-issuing SET (ROLE = SECONDARY) forces them to re-establish the database
+	// mirroring session with the new primary.
+	if effectiveClusterType(ag.Spec.ClusterType) != agClusterTypeNone {
+		if err := r.reconcileNotSynchronizingReplicas(ctx, ag); err != nil {
+			log.Error(err, "Could not reconcile NOT SYNCHRONIZING replicas; will retry on next poll")
+		}
+	}
+
 	// 9. Reconcile PV reclaim policy for all replica PVCs.
 	if err := r.reconcilePVCReclaimPolicy(ctx, ag); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not reconcile PV reclaim policy: %w", err)
@@ -1265,6 +1277,50 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 			log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
 		} else {
 			log.Info("Set SECONDARY role on RESOLVING replica", "pod", podName)
+		}
+	}
+	return nil
+}
+
+// reconcileNotSynchronizingReplicas detects SECONDARY replicas whose databases are stuck
+// in NOT SYNCHRONIZING state (CLUSTER_TYPE = EXTERNAL) and re-seats them by issuing
+// ALTER AVAILABILITY GROUP SET (ROLE = SECONDARY).
+//
+// This handles a common post-failover scenario: after either planned or unplanned failover,
+// secondaries that were syncing with the old primary sometimes do not automatically
+// re-establish database synchronization with the new primary. Their replica role shows
+// SECONDARY but their database synchronization_state_desc stays NOT SYNCHRONIZING.
+// Re-issuing SET (ROLE = SECONDARY) forces SQL Server to tear down and rebuild the
+// database mirroring session, which restores synchronization.
+func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
+	log := logf.FromContext(ctx)
+	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
+		return nil
+	}
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		return err
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+		sqlutil.NotSynchronizingReplicasSQL(ag.Spec.AGName))
+	if err != nil {
+		log.Info("Could not query NOT SYNCHRONIZING replicas from primary", "err", err)
+		return nil
+	}
+	agPrefix := ag.Name + "-"
+	for line := range strings.SplitSeq(result.Stdout, "\n") {
+		replicaName := strings.TrimSpace(line)
+		if replicaName == "" || !strings.HasPrefix(replicaName, agPrefix) {
+			continue
+		}
+		podName := replicaName
+		log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)", "pod", podName)
+		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
+			log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
+		} else {
+			log.Info("Re-seated NOT SYNCHRONIZING replica", "pod", podName)
 		}
 	}
 	return nil

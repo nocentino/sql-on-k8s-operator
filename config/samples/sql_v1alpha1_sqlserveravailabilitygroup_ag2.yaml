@@ -1,0 +1,56 @@
+# SQLServerAvailabilityGroup sample — 3-replica AG with ALL synchronous commit + automatic failover
+# Used for comprehensive failover testing (planned and unplanned).
+# Prerequisites:
+#   kubectl create secret generic mssql-ag2-secret \
+#     --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
+apiVersion: sql.mssql.microsoft.com/v1alpha1
+kind: SQLServerAvailabilityGroup
+metadata:
+  name: mssql-ag2
+  namespace: default
+spec:
+  agName: "AG2"
+  image: mcr.microsoft.com/mssql/server:2025-latest
+  edition: Developer
+  acceptEula: "Y"
+  saPasswordSecretRef:
+    name: mssql-ag2-secret
+    key: SA_PASSWORD
+  endpointPort: 5023
+  clusterType: EXTERNAL
+  automaticFailover:
+    enabled: true
+    failoverThresholdSeconds: 30
+    healthThreshold: system
+  replicas:
+    - name: primary
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+    - name: secondary-1
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+    - name: secondary-2
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+  storage:
+    dataVolumeSize: "20Gi"
+    reclaimPolicy: Retain
+  mssqlConf:
+    "sqlagent.enabled": "true"
+  listener:
+    name: mssql-ag2-listener
+    port: 1434
+    serviceType: LoadBalancer
+  readOnlyListener:
+    name: mssql-ag2-listener-ro
+    port: 1434
+    serviceType: LoadBalancer
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2"
