@@ -20,6 +20,11 @@ limitations under the License.
 package e2e
 
 // agCRYAML is a 3-replica AG CR used in AG lifecycle tests.
+// CLUSTER_TYPE = EXTERNAL lets the operator act as the external cluster manager:
+//   - ALTER AVAILABILITY GROUP ... FAILOVER is available for clean planned failovers.
+//   - The operator detects primary failure via pod health checks and issues
+//     FORCE_FAILOVER_ALLOW_DATA_LOSS on the best synchronous secondary.
+// No Pacemaker installation is required; the operator fulfils the cluster-manager role.
 // The secret mssql-ag-secret must be created before applying.
 const agCRYAML = `
 apiVersion: sql.mssql.microsoft.com/v1alpha1
@@ -35,6 +40,10 @@ spec:
   saPasswordSecretRef:
     name: mssql-ag-secret
     key: SA_PASSWORD
+  clusterType: EXTERNAL
+  automaticFailover:
+    enabled: true
+    failoverThresholdSeconds: 30
   replicas:
     - name: primary
       availabilityMode: SynchronousCommit
@@ -81,6 +90,10 @@ spec:
   saPasswordSecretRef:
     name: mssql-ag-secret
     key: SA_PASSWORD
+  clusterType: EXTERNAL
+  automaticFailover:
+    enabled: true
+    failoverThresholdSeconds: 30
   replicas:
     - name: primary
       availabilityMode: SynchronousCommit

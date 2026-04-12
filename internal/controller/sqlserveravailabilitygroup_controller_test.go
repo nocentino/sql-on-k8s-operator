@@ -115,8 +115,8 @@ var _ = Describe("SQLServerAvailabilityGroup Controller", func() {
 				},
 				EndpointPort: 5022,
 				Replicas: []sqlv1alpha1.AGReplicaSpec{
-					{Name: "primary", AvailabilityMode: sqlv1alpha1.SynchronousCommit, FailoverMode: sqlv1alpha1.AutomaticFailover},
-					{Name: "secondary-1", AvailabilityMode: sqlv1alpha1.SynchronousCommit, FailoverMode: sqlv1alpha1.AutomaticFailover},
+					{Name: "primary", AvailabilityMode: sqlv1alpha1.SynchronousCommit, FailoverMode: sqlv1alpha1.FailoverModeAutomatic},
+					{Name: "secondary-1", AvailabilityMode: sqlv1alpha1.SynchronousCommit, FailoverMode: sqlv1alpha1.FailoverModeAutomatic},
 				},
 				Storage: sqlv1alpha1.SQLServerStorageSpec{
 					DataVolumeSize: resource.MustParse("1Gi"),

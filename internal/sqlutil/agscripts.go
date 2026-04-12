@@ -19,10 +19,85 @@ package sqlutil
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // clusterTypeNone is the SQL Server cluster type for standalone AG (no Pacemaker/WSFC).
 const clusterTypeNone = "NONE"
+
+// PlannedFailoverSQL returns the T-SQL to perform a clean, no-data-loss planned failover
+// on the current replica. The replica becomes the new PRIMARY without any data loss
+// provided the target was SYNCHRONIZED with the old primary before the command was issued.
+//
+// This command is only valid with CLUSTER_TYPE = EXTERNAL. The sp_set_session_context call
+// is required by SQL Server to authorize the operator as the external cluster manager (Msg 47104
+// is returned if it is absent).
+func PlannedFailoverSQL(agName string) string {
+	return fmt.Sprintf(
+		"EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes';\nALTER AVAILABILITY GROUP [%s] FAILOVER;",
+		agName)
+}
+
+// ForcedFailoverSQL returns the T-SQL to perform a forced failover on the current replica.
+// Used for unplanned failover when the primary is unreachable. For a synchronous replica
+// that was SYNCHRONIZED at the time of the primary failure, no data is actually lost.
+//
+// The sp_set_session_context call is required by SQL Server when CLUSTER_TYPE = EXTERNAL
+// to authorize the operator as the external cluster manager (Msg 47104 is returned if absent).
+func ForcedFailoverSQL(agName string) string {
+	return fmt.Sprintf(
+		"EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes';\nALTER AVAILABILITY GROUP [%s] FORCE_FAILOVER_ALLOW_DATA_LOSS;",
+		agName)
+}
+
+// SetRoleToSecondarySQL returns the T-SQL to transition a replica from RESOLVING to SECONDARY role.
+//
+// When CLUSTER_TYPE = EXTERNAL, secondaries land in RESOLVING state after JOIN and stay there
+// until an explicit SET (ROLE = SECONDARY) is issued. This is analogous to Pacemaker's "start"
+// action in the mssql-server-ha agent. Without this step, waitForSecondariesReady times out
+// because the replica never reports role_desc = 'SECONDARY'.
+func SetRoleToSecondarySQL(agName string) string {
+	return fmt.Sprintf("ALTER AVAILABILITY GROUP [%s] SET (ROLE = SECONDARY);", agName)
+}
+
+// ResolvingReplicasSQL returns a query that lists the replica_server_name of every
+// non-local replica that is currently in RESOLVING role, as seen from the primary.
+//
+// Used by the controller to detect replicas that have restarted and need
+// SET (ROLE = SECONDARY) to transition out of RESOLVING state in EXTERNAL mode.
+func ResolvingReplicasSQL(agName string) string {
+	return fmt.Sprintf(`SET NOCOUNT ON;
+SELECT ar.replica_server_name
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states rs ON ar.replica_id = rs.replica_id
+WHERE ag.name = '%s'
+  AND rs.is_local = 0
+  AND rs.role_desc = 'RESOLVING';`, agName)
+}
+
+// SyncReplicaStatesSQL returns a query that yields one row per non-local replica with:
+//   - replica_name  : the short pod hostname (@@SERVERNAME on that pod)
+//   - avail_mode    : SYNCHRONOUS_COMMIT or ASYNCHRONOUS_COMMIT
+//   - sync_state    : SYNCHRONIZED, SYNCHRONIZING, NOT_SYNCHRONIZING, etc.
+//   - role          : PRIMARY or SECONDARY (from the local replica's perspective)
+//
+// Used by the controller to select the best automatic failover target.
+func SyncReplicaStatesSQL(agName string) string {
+	return fmt.Sprintf(`SET NOCOUNT ON;
+SELECT
+    ar.replica_server_name AS replica_name,
+    ar.availability_mode_desc  AS avail_mode,
+    drs.synchronization_state_desc AS sync_state,
+    rs.role_desc AS role
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states rs ON ar.replica_id = rs.replica_id
+LEFT JOIN sys.dm_hadr_database_replica_states drs
+    ON rs.replica_id = drs.replica_id AND drs.is_local = 0
+WHERE ag.name = '%s'
+  AND rs.is_local = 0;`, agName)
+}
 
 // CreateMasterKeySQL returns the T-SQL to create the database master key.
 func CreateMasterKeySQL(password string) string {
@@ -34,13 +109,16 @@ END`, password)
 }
 
 // CreateCertificateSQL returns T-SQL to create the AG endpoint certificate if it doesn't exist.
+// The certificate is created with a 5-year expiry from the current date so that replicas
+// do not need to rotate their endpoint certificates for the expected lifetime of the AG.
 func CreateCertificateSQL(certName, subject, backupPath string) string {
+	expiry := time.Now().AddDate(5, 0, 0).Format("20060102")
 	return fmt.Sprintf(`
 IF NOT EXISTS (SELECT * FROM sys.certificates WHERE name = '%s')
 BEGIN
-    CREATE CERTIFICATE %s WITH SUBJECT = '%s';
+    CREATE CERTIFICATE %s WITH SUBJECT = '%s', EXPIRY_DATE = '%s';
     BACKUP CERTIFICATE %s TO FILE = '%s';
-END`, certName, certName, subject, certName, backupPath)
+END`, certName, certName, subject, expiry, certName, backupPath)
 }
 
 // RestoreCertificateSQL returns T-SQL to import a peer's public certificate from a file.
@@ -153,8 +231,13 @@ func CreateAGSQL(agName, clusterType string, replicas []AGReplicaInput, endpoint
 		if r.AvailabilityMode == "AsynchronousCommit" {
 			availMode = "ASYNCHRONOUS_COMMIT"
 		}
+		// With CLUSTER_TYPE = EXTERNAL, SQL Server requires FAILOVER_MODE = EXTERNAL on
+		// every replica (Msg 47102 is returned if any replica uses FAILOVER_MODE = MANUAL).
+		// With CLUSTER_TYPE = NONE, the only valid value is MANUAL.
+		// The spec's FailoverMode (Automatic vs Manual) controls operator-level behaviour
+		// (whether the controller will auto-failover to this replica), not the SQL value.
 		failoverMode := "MANUAL"
-		if r.FailoverMode == "Automatic" && clusterType != clusterTypeNone {
+		if clusterType != clusterTypeNone {
 			failoverMode = "EXTERNAL"
 		}
 		sep := ","

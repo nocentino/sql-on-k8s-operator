@@ -27,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,8 +39,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sqlv1alpha1 "github.com/anocentino/sql-on-k8s-operator/api/v1alpha1"
 	"github.com/anocentino/sql-on-k8s-operator/internal/sqlutil"
@@ -53,6 +56,15 @@ type SQLServerAvailabilityGroupReconciler struct {
 	RestConfig *rest.Config
 }
 
+// effectiveClusterType returns the string value of the cluster type, defaulting to NONE
+// when the spec field is empty (backward compatibility with CRs that predate the field).
+func effectiveClusterType(ct sqlv1alpha1.AGClusterType) string {
+	if ct == "" {
+		return string(sqlv1alpha1.AGClusterTypeNone)
+	}
+	return string(ct)
+}
+
 // Label keys used to tag AG pod roles so Service selectors can dynamically route traffic.
 const (
 	// labelAGRole is set on every AG pod to reflect its current SQL Server AG role.
@@ -60,6 +72,13 @@ const (
 	labelAGRole = "sql.mssql.microsoft.com/ag-role"
 	// agRolePrimary is the SQL Server AG role string returned by DMV queries for the primary replica.
 	agRolePrimary = "PRIMARY"
+	// agRoleSecondary is the SQL Server AG role string returned by DMV queries for secondary replicas.
+	agRoleSecondary = "SECONDARY"
+	// agRoleResolving is the SQL Server AG role string for replicas in transition (e.g. after JOIN or restart).
+	agRoleResolving = "RESOLVING"
+	// agClusterTypeNone is the T-SQL cluster type string for standalone (read-scale) mode.
+	// Defined as a named constant to satisfy goconst and give callsites a self-documenting name.
+	agClusterTypeNone = "NONE"
 )
 
 // +kubebuilder:rbac:groups=sql.mssql.microsoft.com,resources=sqlserveravailabilitygroups,verbs=get;list;watch;create;update;patch;delete
@@ -133,6 +152,27 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 	// 6. Update AG status (replica roles, sync states)
 	if err := r.updateAGStatus(ctx, ag); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not update AG status: %w", err)
+	}
+
+	// 7. Automatic failover detection (CLUSTER_TYPE = EXTERNAL only).
+	// reconcileFailover checks whether the primary pod is NotReady and, if it has
+	// been NotReady for longer than the configured threshold, promotes the best
+	// synchronous secondary. It returns a non-zero RequeueAfter while it is waiting.
+	if result, err := r.reconcileFailover(ctx, ag); err != nil {
+		return ctrl.Result{}, err
+	} else if result.RequeueAfter > 0 {
+		return result, nil
+	}
+
+	// 8. RESOLVING replica detection (CLUSTER_TYPE = EXTERNAL only).
+	// After an unplanned failover the killed primary pod restarts and reconnects to
+	// the AG but lands in RESOLVING state. Without an explicit SET (ROLE = SECONDARY)
+	// it stays there indefinitely. reconcileResolvingReplicas detects such replicas
+	// on the primary and transitions each one to SECONDARY.
+	if effectiveClusterType(ag.Spec.ClusterType) != agClusterTypeNone {
+		if err := r.reconcileResolvingReplicas(ctx, ag); err != nil {
+			log.Error(err, "Could not reconcile RESOLVING replicas; will retry on next poll")
+		}
 	}
 
 	// Requeue periodically to keep status fresh and detect failovers
@@ -381,6 +421,42 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcilePodLabels(ctx context.Co
 	return nil
 }
 
+// joinSecondaries runs ALTER AVAILABILITY GROUP JOIN on every secondary pod (index 1..N-1)
+// and, for CLUSTER_TYPE = EXTERNAL, immediately transitions each replica from RESOLVING
+// to SECONDARY via ALTER AVAILABILITY GROUP SET (ROLE = SECONDARY).
+//
+// This is extracted from bootstrapAG to keep that function's cyclomatic complexity within
+// the linter threshold while keeping the logic easy to read.
+func (r *SQLServerAvailabilityGroupReconciler) joinSecondaries(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	saPassword, clusterType string,
+) ctrl.Result {
+	log := logf.FromContext(ctx)
+	replicas := ag.Spec.Replicas
+	for i := 1; i < len(replicas); i++ {
+		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
+		if _, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+			sqlutil.JoinAGSQL(ag.Spec.AGName, clusterType)); err != nil {
+			log.Error(err, "Could not join AG on secondary", "pod", secondaryPod)
+			return ctrl.Result{RequeueAfter: 15 * time.Second}
+		}
+		log.Info("Joined AG on secondary", "pod", secondaryPod)
+		if clusterType != agClusterTypeNone {
+			// Transition from RESOLVING → SECONDARY so SQL Server reports the replica
+			// as SECONDARY+CONNECTED and the operator's health monitoring can proceed.
+			if _, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+				sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); err != nil {
+				log.Error(err, "Could not set secondary role on secondary", "pod", secondaryPod)
+				return ctrl.Result{RequeueAfter: 15 * time.Second}
+			}
+			log.Info("Set SECONDARY role on secondary", "pod", secondaryPod)
+		}
+	}
+	return ctrl.Result{}
+}
+
 // bootstrapAG orchestrates the T-SQL AG setup across all replica pods.
 // Steps:
 //  1. Wait until all pods are ready
@@ -540,8 +616,9 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	}
 
 	if !agAlreadyExists {
-		createSQL := sqlutil.CreateAGSQL(ag.Spec.AGName, "NONE", replicaInputs, endpointPort)
-		log.Info("Creating Availability Group", "ag", ag.Spec.AGName)
+		clusterType := effectiveClusterType(ag.Spec.ClusterType)
+		createSQL := sqlutil.CreateAGSQL(ag.Spec.AGName, clusterType, replicaInputs, endpointPort)
+		log.Info("Creating Availability Group", "ag", ag.Spec.AGName, "clusterType", clusterType)
 		if _, createErr := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword, createSQL); createErr != nil {
 			return ctrl.Result{}, fmt.Errorf("could not create AG on primary: %w", createErr)
 		}
@@ -549,15 +626,10 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 		log.Info("Availability Group already exists, skipping CREATE", "ag", ag.Spec.AGName)
 	}
 
-	// Step 6: JOIN on each secondary.
-	for i := 1; i < len(replicas); i++ {
-		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
-		if _, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
-			sqlutil.JoinAGSQL(ag.Spec.AGName, "NONE")); err != nil {
-			log.Error(err, "Could not join AG on secondary", "pod", secondaryPod)
-			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
-		}
-		log.Info("Joined AG on secondary", "pod", secondaryPod)
+	// Step 6: JOIN on each secondary and, for EXTERNAL clusters, transition from RESOLVING.
+	clusterType := effectiveClusterType(ag.Spec.ClusterType)
+	if result := r.joinSecondaries(ctx, ag, exec, saPassword, clusterType); result.RequeueAfter > 0 {
+		return result, nil
 	}
 
 	// Step 7: Wait for all secondaries to reach SECONDARY+CONNECTED before declaring
@@ -614,10 +686,7 @@ func (r *SQLServerAvailabilityGroupReconciler) dropAGOnAllReplicas(
 
 // waitForSecondariesReady polls the primary until all secondary replicas report
 // both role_desc = 'SECONDARY' AND connected_state_desc = 'CONNECTED', waiting
-// up to 10 minutes (60 × 10 s). It returns true only after the required state
-// has been observed for requiredConsecutive consecutive polls (default 3, i.e.
-// 30 seconds of stable connectivity), ensuring DNS and HADR transport are
-// genuinely stable before bootstrap is declared complete.
+// up to 10 minutes (60 × 10 s).
 //
 // Both conditions are required because:
 //   - role_desc = 'SECONDARY' is set by the protocol JOIN message and can be
@@ -627,9 +696,16 @@ func (r *SQLServerAvailabilityGroupReconciler) dropAGOnAllReplicas(
 //   - connected_state_desc = 'CONNECTED' confirms the HADR transport session is
 //     actively established, so reads/replication are actually flowing.
 //
-// The consecutive-success requirement guards against transient "blips" where a
-// pod briefly flips to SECONDARY+CONNECTED before DNS or certificates drop the
-// session again (observed on Docker Desktop ARM64 during rapid bootstrap).
+// Consecutive-success requirement:
+//   - CLUSTER_TYPE = NONE: 3 consecutive polls (30 s). Guards against transient
+//     "blips" where DNS or certificates drop the session briefly after CREATE AG
+//     (observed on Docker Desktop ARM64).
+//   - CLUSTER_TYPE = EXTERNAL: 1 poll. With EXTERNAL the HADR handshake goes
+//     through a more complex quorum negotiation phase, so the connection oscillates
+//     briefly between polls even though transport is established (evidenced by
+//     seeding proceeding in the SQL Server log). Once all secondaries are observed
+//     CONNECTED the operator's continuous reconciliation loop takes over health
+//     monitoring, making the 30-second stability window unnecessary.
 func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
 	ctx context.Context,
 	sqlExec *sqlutil.Executor,
@@ -639,10 +715,13 @@ func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
 ) bool {
 	log := logf.FromContext(ctx)
 	wantSecondaries := replicaCount - 1
-	const (
-		maxAttempts         = 60 // 60 × 10 s = 10 min total
-		requiredConsecutive = 3  // 3 × 10 s = 30 s stable connectivity required
-	)
+	const maxAttempts = 60 // 60 × 10 s = 10 min total
+	// With EXTERNAL the operator acts as the cluster manager; one confirmed
+	// CONNECTED observation is sufficient — health monitoring continues after bootstrap.
+	requiredConsecutive := 3
+	if effectiveClusterType(ag.Spec.ClusterType) != "NONE" {
+		requiredConsecutive = 1
+	}
 	consecutiveOK := 0
 	log.Info("Waiting for secondaries to reach SECONDARY+CONNECTED state",
 		"ag", ag.Spec.AGName, "expected", wantSecondaries, "requiredConsecutive", requiredConsecutive)
@@ -730,6 +809,7 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 	// Collect roles for all replicas in one pass so we can update pod labels atomically.
 	replicaRoles := make(map[string]string, len(ag.Spec.Replicas))
 	var statuses []sqlv1alpha1.AGReplicaStatus
+	foundPrimary := false
 	for i := range ag.Spec.Replicas {
 		podName := fmt.Sprintf("%s-%d", ag.Name, i)
 		role, _ := exec.GetAGRole(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
@@ -737,6 +817,7 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 		replicaRoles[podName] = role
 		if role == agRolePrimary {
 			ag.Status.PrimaryReplica = podName
+			foundPrimary = true
 		}
 
 		// Only stamp LastSeenPrimary when this pod is the active primary.
@@ -758,6 +839,28 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 		})
 	}
 	ag.Status.ReplicaStatuses = statuses
+
+	// If no live pod reported PRIMARY but the recorded primary is itself reporting
+	// SECONDARY, the status.primaryReplica is stale — this happens after an
+	// externally-initiated planned failover (e.g., ALTER AG FAILOVER run by a test)
+	// when the controller has not yet observed the new primary.
+	// Recover by identifying the unreachable pod as the inferred primary so that
+	// reconcileFailover can correctly detect the pod failure and start the timer.
+	if !foundPrimary && replicaRoles[ag.Status.PrimaryReplica] == agRoleSecondary {
+		log := logf.FromContext(ctx)
+		for i := range ag.Spec.Replicas {
+			podName := fmt.Sprintf("%s-%d", ag.Name, i)
+			if podName == ag.Status.PrimaryReplica {
+				continue
+			}
+			if replicaRoles[podName] == "" { // GetAGRole failed → pod unreachable
+				log.Info("Correcting stale primary: recorded primary is SECONDARY, inferred primary from unreachable pod",
+					"stale", ag.Status.PrimaryReplica, "inferred", podName)
+				ag.Status.PrimaryReplica = podName
+				break
+			}
+		}
+	}
 
 	// Update pod labels so the listener and read-only Services route correctly.
 	// This is best-effort: a labelling failure should not prevent status from being saved.
@@ -928,6 +1031,370 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 	}
 }
 
+// isPodReady returns true if the pod has a Ready condition with status True.
+func isPodReady(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// selectFailoverTarget picks the best synchronous secondary for an unplanned failover.
+//
+// Selection is done in two passes:
+//  1. Prefer replicas whose synchronization_health_desc = HEALTHY (all databases SYNCHRONIZED).
+//     This guarantees zero data loss for synchronous-commit replicas.
+//  2. If no HEALTHY replica is found (e.g. primary just died and secondaries are still
+//     transitioning, or SQL Server is temporarily unresponsive), fall back to the first
+//     configured SynchronousCommit/Automatic replica. The FORCE_FAILOVER_ALLOW_DATA_LOSS
+//     command on a synchronous replica that was SYNCHRONIZED before the primary died incurs
+//     no actual data loss despite the command name.
+//
+// A replica is considered for either pass only when:
+//   - AvailabilityMode = SynchronousCommit — async replicas are never auto-failed over to.
+//   - FailoverMode = Automatic — only replicas explicitly configured for automatic failover.
+//
+// NOTE: We intentionally do NOT pre-filter candidates by SQL reachability. After an unplanned
+// primary failure, secondaries may be temporarily unresponsive to SELECT 1 (e.g. RESOLVING
+// state transitions, redo thread activity, or transient kubelet exec latency). Skipping them
+// entirely would leave the AG in a headless state indefinitely. Instead, we capture them as
+// best-effort candidates and let the subsequent FORCE_FAILOVER_ALLOW_DATA_LOSS command fail
+// and retry until the target is ready to accept commands.
+//
+// NOTE: synchronization_state_desc (SYNCHRONIZED/SYNCHRONIZING) lives in
+// sys.dm_hadr_DATABASE_replica_states, not sys.dm_hadr_availability_replica_states.
+// We use GetAGSyncState which reads synchronization_health_desc (HEALTHY/PARTIALLY_HEALTHY/
+// NOT_HEALTHY) from the replica-level DMV — the correct aggregate for this decision.
+func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (string, error) {
+	log := logf.FromContext(ctx)
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		return "", err
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+
+	var bestEffort string // first configured sync/auto replica — used as fallback
+	for i, rep := range ag.Spec.Replicas {
+		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		if podName == ag.Status.PrimaryReplica {
+			continue
+		}
+		if rep.AvailabilityMode != sqlv1alpha1.SynchronousCommit {
+			continue // never auto-failover to asynchronous replicas
+		}
+		if rep.FailoverMode != sqlv1alpha1.FailoverModeAutomatic {
+			continue // only promote replicas explicitly configured for automatic failover
+		}
+
+		// Check replica-level synchronization health.
+		// If the check fails (SQL Server temporarily unreachable), keep the candidate as
+		// best-effort rather than skipping it entirely. The FORCE_FAILOVER command will be
+		// retried and will succeed once the target's SQL Server is ready to accept commands.
+		health, hErr := exec.GetAGSyncState(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
+		if hErr != nil {
+			log.Info("Could not check sync health for candidate; keeping as best-effort fallback",
+				"pod", podName, "err", hErr)
+			if bestEffort == "" {
+				bestEffort = podName
+			}
+			continue
+		}
+
+		log.Info("Candidate synchronous replica sync health", "pod", podName, "health", health)
+		if health == "HEALTHY" {
+			// All databases SYNCHRONIZED — ideal target, no data loss.
+			return podName, nil
+		}
+
+		// Reachable but not HEALTHY (e.g. primary just died, replica is transitioning).
+		// Record as best-effort fallback; keep searching for a HEALTHY candidate.
+		if bestEffort == "" {
+			bestEffort = podName
+		}
+		log.Info("Candidate not HEALTHY; keeping as best-effort fallback", "pod", podName, "health", health)
+	}
+
+	if bestEffort != "" {
+		log.Info("No HEALTHY replica found; using best-effort replica for force failover",
+			"pod", bestEffort)
+		return bestEffort, nil
+	}
+
+	return "", fmt.Errorf("no SynchronousCommit replica with failoverMode=Automatic available for automatic failover")
+}
+
+// reconcileResolvingReplicas detects secondaries stuck in RESOLVING role (CLUSTER_TYPE = EXTERNAL)
+// and transitions each one to SECONDARY by issuing ALTER AVAILABILITY GROUP SET (ROLE = SECONDARY).
+//
+// This handles the pod-restart case: after an unplanned failover, the killed primary pod
+// restarts and reconnects to the AG but remains in RESOLVING state indefinitely — SQL Server
+// requires the external cluster manager to explicitly grant it the SECONDARY role. This is
+// analogous to Pacemaker's "start" action in the mssql-server-ha OCF agent.
+//
+// The function queries the current primary for non-local replicas in RESOLVING state and
+// issues the transition command directly on each affected pod's SQL connection.
+func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
+	log := logf.FromContext(ctx)
+	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
+		return nil
+	}
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		return err
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+		sqlutil.ResolvingReplicasSQL(ag.Spec.AGName))
+	if err != nil {
+		// Primary may be mid-failover; log and return nil to avoid blocking the reconcile loop.
+		log.Info("Could not query RESOLVING replicas from primary", "err", err)
+		return nil
+	}
+	// Filter output lines to valid pod names.
+	// sqlcmd output (without -h -1) includes a column-header line (e.g.
+	// "replica_server_name") and a separator line ("----------...") before the
+	// data rows.  Pod names in this operator are always prefixed with the AG
+	// name followed by a hyphen (e.g. "mssql-ag-0"), so any other line is noise.
+	agPrefix := ag.Name + "-"
+	for line := range strings.SplitSeq(result.Stdout, "\n") {
+		replicaName := strings.TrimSpace(line)
+		if replicaName == "" || !strings.HasPrefix(replicaName, agPrefix) {
+			continue // skip blank lines, column headers, and separator lines
+		}
+		// replica_server_name matches the pod name (@@SERVERNAME = short pod hostname).
+		podName := replicaName
+		log.Info("Detected RESOLVING secondary; transitioning to SECONDARY", "pod", podName)
+		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
+			log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
+		} else {
+			log.Info("Set SECONDARY role on RESOLVING replica", "pod", podName)
+		}
+	}
+	return nil
+}
+
+// forceFailoverHeadlessAG handles the "headless AG" scenario: the recorded primary pod
+// is K8s-Ready but is serving as SECONDARY/RESOLVING (e.g. after an unplanned kill +
+// pod restart), leaving the AG with no active primary.
+//
+// Returns a non-empty ctrl.Result when it handled the situation (corrected status, issued
+// force failover, or queued a retry). Returns ctrl.Result{} when the pod is genuinely
+// serving as PRIMARY (or SQL is unreachable — we treat that conservatively as healthy).
+func (r *SQLServerAvailabilityGroupReconciler) forceFailoverHeadlessAG(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	primaryPodName string,
+	patch client.Patch,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	saPassword, pwErr := r.getSAPassword(ctx, ag)
+	if pwErr != nil {
+		return ctrl.Result{}, nil // can't verify — treat conservatively as healthy
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+
+	actualRole, _ := exec.GetAGRole(ctx, ag.Namespace, primaryPodName, "mssql", saPassword, ag.Spec.AGName)
+	if actualRole != agRoleSecondary && actualRole != agRoleResolving {
+		return ctrl.Result{}, nil // pod IS primary (or SQL unreachable) — nothing to do
+	}
+
+	// Pod is K8s-Ready but NOT serving as primary. Check if another pod is.
+	for i := range ag.Spec.Replicas {
+		candidatePod := fmt.Sprintf("%s-%d", ag.Name, i)
+		if candidatePod == primaryPodName {
+			continue
+		}
+		role, _ := exec.GetAGRole(ctx, ag.Namespace, candidatePod, "mssql", saPassword, ag.Spec.AGName)
+		if role == agRolePrimary {
+			log.Info("Correcting stale primary record; another pod is PRIMARY",
+				"old", primaryPodName, "new", candidatePod)
+			ag.Status.PrimaryReplica = candidatePod
+			ag.Status.PrimaryNotReadySince = nil
+			if sErr := r.Status().Patch(ctx, ag, patch); sErr != nil {
+				return ctrl.Result{}, fmt.Errorf("could not update primary record: %w", sErr)
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	// No pod is PRIMARY — the AG is headless. Trigger immediate force failover.
+	log.Info("AG is headless (no primary); triggering immediate force failover",
+		"recordedPrimary", primaryPodName)
+
+	targetPod, selErr := r.selectFailoverTarget(ctx, ag)
+	if selErr != nil || targetPod == "" {
+		log.Info("No eligible failover target for headless AG; will retry", "err", selErr)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	if _, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
+		sqlutil.ForcedFailoverSQL(ag.Spec.AGName)); foErr != nil {
+		log.Error(foErr, "Forced failover command failed for headless AG; will retry", "target", targetPod)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	log.Info("Headless AG force failover succeeded", "newPrimary", targetPod, "formerPrimary", primaryPodName)
+	now := metav1.Now()
+	ag.Status.PrimaryReplica = targetPod
+	ag.Status.PrimaryNotReadySince = nil
+	ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
+	apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+		Type:               "Failover",
+		Status:             metav1.ConditionTrue,
+		Reason:             "HeadlessAGFailover",
+		Message:            fmt.Sprintf("Force failover from headless AG: %s → %s", primaryPodName, targetPod),
+		ObservedGeneration: ag.Generation,
+		LastTransitionTime: now,
+	})
+	if sErr := r.Status().Patch(ctx, ag, patch); sErr != nil {
+		return ctrl.Result{}, fmt.Errorf("could not update status after headless failover: %w", sErr)
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// reconcileFailover detects primary pod failures and automatically promotes a synchronous
+// secondary. It is a no-op unless AutomaticFailover is enabled.
+//
+// With CLUSTER_TYPE = EXTERNAL the operator acts as the external cluster manager and issues
+// FORCE_FAILOVER_ALLOW_DATA_LOSS (prefixed with sp_set_session_context to authorize the DDL).
+// For a synchronous replica that was SYNCHRONIZED at the time of the primary failure, no
+// data is actually lost despite the command name.
+//
+// State machine:
+//  1. Primary pod is Ready           → clear PrimaryNotReadySince, return.
+//  2. Primary pod is NotReady        → record PrimaryNotReadySince (first observation), requeue.
+//  3. NotReady for < threshold       → wait, requeue with remaining time.
+//  4. NotReady for >= threshold      → select best synchronous target, issue FORCE_FAILOVER,
+//     update status.PrimaryReplica and clear PrimaryNotReadySince.
+func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	af := ag.Spec.AutomaticFailover
+	if af == nil || !af.Enabled {
+		return ctrl.Result{}, nil
+	}
+	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
+		return ctrl.Result{}, nil
+	}
+
+	primaryPodName := ag.Status.PrimaryReplica
+	primaryPod := &corev1.Pod{}
+	podGetErr := r.Get(ctx, types.NamespacedName{Name: primaryPodName, Namespace: ag.Namespace}, primaryPod)
+	if podGetErr != nil && !errors.IsNotFound(podGetErr) {
+		return ctrl.Result{}, podGetErr
+	}
+	podReady := podGetErr == nil && isPodReady(primaryPod)
+
+	patch := client.MergeFrom(ag.DeepCopy())
+
+	if podReady {
+		// The primary pod is K8s-Ready, but it may have restarted after being killed and
+		// come back as SECONDARY/RESOLVING, leaving the AG with no active primary ("headless
+		// AG"). forceFailoverHeadlessAG detects this via SQL and issues an immediate force
+		// failover without waiting for the NotReady timer.
+		if result, hErr := r.forceFailoverHeadlessAG(ctx, ag, primaryPodName, patch); hErr != nil || result != (ctrl.Result{}) {
+			return result, hErr
+		}
+
+		// Pod is genuinely serving as PRIMARY (or SQL is unreachable — treated conservatively).
+		if ag.Status.PrimaryNotReadySince != nil {
+			log.Info("Primary pod recovered; clearing failover timer", "pod", primaryPodName)
+			ag.Status.PrimaryNotReadySince = nil
+			if err := r.Status().Patch(ctx, ag, patch); err != nil {
+				return ctrl.Result{}, fmt.Errorf("could not clear PrimaryNotReadySince: %w", err)
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Primary is NotReady (or missing).
+	threshold := time.Duration(af.FailoverThresholdSeconds) * time.Second
+	if threshold < 10*time.Second {
+		threshold = 30 * time.Second
+	}
+	now := metav1.Now()
+
+	if ag.Status.PrimaryNotReadySince == nil {
+		log.Info("Primary pod NotReady; starting failover threshold timer",
+			"pod", primaryPodName, "threshold", threshold)
+		ag.Status.PrimaryNotReadySince = &now
+		if err := r.Status().Patch(ctx, ag, patch); err != nil {
+			return ctrl.Result{}, fmt.Errorf("could not set PrimaryNotReadySince: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: threshold}, nil
+	}
+
+	elapsed := time.Since(ag.Status.PrimaryNotReadySince.Time)
+	if elapsed < threshold {
+		remaining := threshold - elapsed
+		log.Info("Primary pod NotReady; waiting for threshold",
+			"pod", primaryPodName, "elapsed", elapsed.Round(time.Second), "remaining", remaining.Round(time.Second))
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	// Threshold exceeded — select and promote the best synchronous secondary.
+	log.Info("Primary NotReady threshold exceeded; selecting failover target",
+		"pod", primaryPodName, "elapsed", elapsed.Round(time.Second))
+
+	targetPod, selErr := r.selectFailoverTarget(ctx, ag)
+	if selErr != nil || targetPod == "" {
+		log.Info("No eligible failover target; will retry", "err", selErr)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+	if _, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
+		sqlutil.ForcedFailoverSQL(ag.Spec.AGName)); foErr != nil {
+		log.Error(foErr, "Forced failover command failed; will retry", "target", targetPod)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	log.Info("Automatic unplanned failover succeeded", "newPrimary", targetPod, "formerPrimary", primaryPodName)
+	ag.Status.PrimaryReplica = targetPod
+	ag.Status.PrimaryNotReadySince = nil
+	ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
+	apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+		Type:               "Failover",
+		Status:             metav1.ConditionTrue,
+		Reason:             "UnplannedFailover",
+		Message:            fmt.Sprintf("Automatic failover from %s to %s after primary was NotReady for %s", primaryPodName, targetPod, elapsed.Round(time.Second)),
+		ObservedGeneration: ag.Generation,
+		LastTransitionTime: now,
+	})
+	if err := r.Status().Patch(ctx, ag, patch); err != nil {
+		return ctrl.Result{}, fmt.Errorf("could not update status after failover: %w", err)
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// mapPodToAG maps an AG replica pod back to a reconcile request for its owning
+// SQLServerAvailabilityGroup CR. AG pods carry the label "app: <agName>" set by
+// buildAGStatefulSet. If the label is absent or the AG is not found the pod is
+// ignored (returns nil).
+func (r *SQLServerAvailabilityGroupReconciler) mapPodToAG(ctx context.Context, obj client.Object) []reconcile.Request {
+	agName, ok := obj.GetLabels()["app"]
+	if !ok {
+		return nil
+	}
+	// Confirm the named AG actually exists before enqueuing.
+	ag := &sqlv1alpha1.SQLServerAvailabilityGroup{}
+	if err := r.Get(ctx, types.NamespacedName{Name: agName, Namespace: obj.GetNamespace()}, ag); err != nil {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: agName, Namespace: obj.GetNamespace()}}}
+}
+
 // SetupWithManager sets up the AG controller with the Manager.
 func (r *SQLServerAvailabilityGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// GenerationChangedPredicate suppresses status-only update events.
@@ -935,11 +1402,26 @@ func (r *SQLServerAvailabilityGroupReconciler) SetupWithManager(mgr ctrl.Manager
 	// predicate breaks the status-patch → watch-event → reconcile feedback loop
 	// that would otherwise cause ~1 Hz runaway reconciliation.
 	genChanged := predicate.GenerationChangedPredicate{}
+
+	// isManagedAGPod is true for pods created by this operator's AG StatefulSets.
+	// These pods carry the "app.kubernetes.io/managed-by" label set in buildAGStatefulSet.
+	// Watching them lets the controller react quickly to primary pod readiness changes
+	// without waiting for the 60-second RequeueAfter poll interval.
+	isManagedAGPod := predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return obj.GetLabels()["app.kubernetes.io/managed-by"] == "sql-on-k8s-operator" &&
+			obj.GetLabels()["role"] == "mssql-ag"
+	})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sqlv1alpha1.SQLServerAvailabilityGroup{}, builder.WithPredicates(genChanged)).
 		Owns(&appsv1.StatefulSet{}, builder.WithPredicates(genChanged)).
 		Owns(&corev1.Service{}, builder.WithPredicates(genChanged)).
 		Owns(&corev1.ConfigMap{}, builder.WithPredicates(genChanged)).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.mapPodToAG),
+			builder.WithPredicates(isManagedAGPod),
+		).
 		Named("sqlserveravailabilitygroup").
 		Complete(r)
 }

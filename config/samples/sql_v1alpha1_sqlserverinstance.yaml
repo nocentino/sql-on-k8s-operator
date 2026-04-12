@@ -1,4 +1,4 @@
-# SQLServerInstance sample — standalone SQL Server 2022 Developer Edition
+# SQLServerInstance sample — standalone SQL Server 2025 Developer Edition
 # Prerequisites:
 #   kubectl create secret generic mssql-secret \
 #     --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
@@ -8,7 +8,7 @@ metadata:
   name: mssql-standalone
   namespace: default
 spec:
-  image: mcr.microsoft.com/mssql/server:2022-latest
+  image: mcr.microsoft.com/mssql/server:2025-latest
   edition: Developer
   acceptEula: "Y"
   saPasswordSecretRef:

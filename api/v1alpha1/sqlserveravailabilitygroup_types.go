@@ -35,9 +35,39 @@ const (
 type FailoverMode string
 
 const (
-	AutomaticFailover FailoverMode = "Automatic"
-	ManualFailover    FailoverMode = "Manual"
+	FailoverModeAutomatic FailoverMode = "Automatic"
+	FailoverModeManual    FailoverMode = "Manual"
 )
+
+// AGClusterType specifies the SQL Server cluster type for the Availability Group.
+// +kubebuilder:validation:Enum=NONE;EXTERNAL
+type AGClusterType string
+
+const (
+	// AGClusterTypeNone is the original read-scale mode. All failover must be manual.
+	AGClusterTypeNone AGClusterType = "NONE"
+	// AGClusterTypeExternal designates the operator as the external cluster manager.
+	// It enables clean planned failover (ALTER AG FAILOVER) and allows the operator
+	// to issue FORCE_FAILOVER_ALLOW_DATA_LOSS for unplanned failover when the primary pod
+	// becomes unhealthy.
+	AGClusterTypeExternal AGClusterType = "EXTERNAL"
+)
+
+// AutomaticFailoverSpec configures the operator's automatic unplanned-failover behaviour.
+// Only meaningful when ClusterType is EXTERNAL.
+type AutomaticFailoverSpec struct {
+	// Enabled controls whether the operator will automatically promote a synchronous
+	// secondary when the primary pod is continuously NotReady for FailoverThresholdSeconds.
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled"`
+
+	// FailoverThresholdSeconds is how long (in seconds) the primary pod must be
+	// continuously NotReady before the operator triggers an automatic failover.
+	// Minimum 10 seconds. Defaults to 30 seconds.
+	// +kubebuilder:default=30
+	// +kubebuilder:validation:Minimum=10
+	FailoverThresholdSeconds int32 `json:"failoverThresholdSeconds,omitempty"`
+}
 
 // AGReplicaSpec defines the desired state of one AG replica.
 type AGReplicaSpec struct {
@@ -68,8 +98,11 @@ type ListenerSpec struct {
 	// +kubebuilder:default=1433
 	Port int32 `json:"port,omitempty"`
 
-	// ServiceType controls how the listener is exposed (ClusterIP or LoadBalancer).
-	// +kubebuilder:validation:Enum=ClusterIP;LoadBalancer
+	// ServiceType controls how the listener is exposed.
+	// ClusterIP exposes the listener inside the cluster only.
+	// NodePort exposes the listener on each node's IP at a static port.
+	// LoadBalancer provisions an external load balancer (cloud providers).
+	// +kubebuilder:validation:Enum=ClusterIP;NodePort;LoadBalancer
 	// +kubebuilder:default=ClusterIP
 	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
 }
@@ -113,6 +146,20 @@ type SQLServerAvailabilityGroupSpec struct {
 	// +kubebuilder:default=5022
 	// +optional
 	EndpointPort int32 `json:"endpointPort,omitempty"`
+
+	// ClusterType sets the SQL Server cluster type for the Availability Group.
+	// NONE means read-scale only with fully manual failover.
+	// EXTERNAL means the operator acts as the external cluster manager, enabling
+	// clean planned failover and automatic unplanned failover to synchronous replicas.
+	// +kubebuilder:validation:Enum=NONE;EXTERNAL
+	// +kubebuilder:default=NONE
+	// +optional
+	ClusterType AGClusterType `json:"clusterType,omitempty"`
+
+	// AutomaticFailover configures the operator's automatic unplanned-failover behaviour.
+	// Only effective when ClusterType is EXTERNAL.
+	// +optional
+	AutomaticFailover *AutomaticFailoverSpec `json:"automaticFailover,omitempty"`
 
 	// Listener configures the read-write AG listener Service.
 	// The service selector is automatically updated to point only at the current primary replica.
@@ -181,6 +228,13 @@ type SQLServerAvailabilityGroupStatus struct {
 	// ReplicaStatuses holds per-replica observed state.
 	// +optional
 	ReplicaStatuses []AGReplicaStatus `json:"replicaStatuses,omitempty"`
+
+	// PrimaryNotReadySince records when the current primary pod first became NotReady.
+	// The operator uses this timestamp together with AutomaticFailover.FailoverThresholdSeconds
+	// to decide when to trigger an automatic unplanned failover.
+	// Cleared when the primary recovers or after a successful failover.
+	// +optional
+	PrimaryNotReadySince *metav1.Time `json:"primaryNotReadySince,omitempty"`
 
 	// Conditions represent the current state of the AG.
 	// +listType=map

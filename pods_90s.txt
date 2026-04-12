@@ -1,2 +1,0 @@
-NAME                 READY   STATUS             RESTARTS      AGE
-mssql-standalone-0   0/1     CrashLoopBackOff   4 (19s ago)   119s

@@ -24,10 +24,11 @@ The operator provides two custom resources:
 - A headless `Service` for intra-cluster DNS (`<pod>.<ag>.svc.cluster.local`)
 - A `ConfigMap` with `mssql.conf` applied to every replica
 - Certificate-based AG endpoint authentication (self-signed, managed by the operator)
-- T-SQL bootstrap: `CREATE AVAILABILITY GROUP … WITH (CLUSTER_TYPE = NONE)` with `SEEDING_MODE = AUTOMATIC`
+- T-SQL bootstrap: `CREATE AVAILABILITY GROUP … WITH (CLUSTER_TYPE = NONE|EXTERNAL)` and `SEEDING_MODE = AUTOMATIC`
 - A read-write **listener** `Service` whose selector tracks the current PRIMARY replica
 - An optional read-only **listener** `Service` that targets readable SECONDARY replicas with `ClientIP` session affinity
 - Per-replica status (role, synchronization state, connected)
+- **Automatic unplanned failover** (when `clusterType: EXTERNAL`) — the operator promotes the best synchronous secondary when the primary pod is continuously unhealthy beyond a configurable threshold
 
 ## Prerequisites
 
@@ -40,6 +41,17 @@ The operator provides two custom resources:
 ## Quick Start
 
 ### 1. Deploy the operator
+
+**Option A — from Docker Hub (recommended):**
+
+```sh
+# Install CRDs and deploy the controller directly from the published image
+kubectl apply -f https://raw.githubusercontent.com/anocentino/sql-on-k8s-operator/main/dist/install.yaml
+```
+
+The controller image (`nocentino/sql-on-k8s-operator:latest`) is available on Docker Hub for both `linux/amd64` and `linux/arm64`.
+
+**Option B — build from source:**
 
 ```sh
 # Build and push the controller image
@@ -75,7 +87,7 @@ metadata:
   name: mssql-standalone
   namespace: default
 spec:
-  image: mcr.microsoft.com/mssql/server:2022-latest
+  image: mcr.microsoft.com/mssql/server:2025-latest
   edition: Developer
   acceptEula: "Y"
   saPasswordSecretRef:
@@ -119,7 +131,7 @@ metadata:
   namespace: default
 spec:
   agName: "AG1"
-  image: mcr.microsoft.com/mssql/server:2022-latest
+  image: mcr.microsoft.com/mssql/server:2025-latest
   edition: Developer
   acceptEula: "Y"
   saPasswordSecretRef:
@@ -165,7 +177,7 @@ spec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `image` | string | `mcr.microsoft.com/mssql/server:2022-latest` | SQL Server container image |
+| `image` | string | `mcr.microsoft.com/mssql/server:2025-latest` | SQL Server container image |
 | `edition` | string | `Developer` | `Developer`, `Express`, `Standard`, `Enterprise`, `EnterpriseCore` |
 | `acceptEula` | string | `Y` | Must be `Y` to accept the SQL Server EULA |
 | `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
@@ -182,7 +194,7 @@ spec:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `agName` | string | — | T-SQL name of the Availability Group |
-| `image` | string | `mcr.microsoft.com/mssql/server:2022-latest` | SQL Server container image (all replicas) |
+| `image` | string | `mcr.microsoft.com/mssql/server:2025-latest` | SQL Server container image (all replicas) |
 | `edition` | string | `Developer` | SQL Server edition |
 | `acceptEula` | string | `Y` | Must be `Y` |
 | `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
@@ -191,6 +203,9 @@ spec:
 | `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size per replica |
 | `storage.storageClassName` | string | — | StorageClass name |
 | `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` on every replica; `hadr.hadrenabled=1` is always set automatically |
+| `clusterType` | string | `NONE` | AG cluster type: `NONE` (read-scale, manual failover) or `EXTERNAL` (operator-managed, enables automatic failover) |
+| `automaticFailover.enabled` | bool | `true` | Promote a synchronous secondary automatically when the primary is unhealthy (requires `clusterType: EXTERNAL`) |
+| `automaticFailover.failoverThresholdSeconds` | int32 | `30` | Seconds the primary must be continuously NotReady before an automatic failover is triggered (minimum 10) |
 | `listener` | ListenerSpec | — | Read-write Service pointing at the current PRIMARY |
 | `readOnlyListener` | ListenerSpec | — | Read-only Service pointing at readable SECONDARY replicas |
 | `resources` | ResourceRequirements | — | CPU and memory requests/limits per replica |

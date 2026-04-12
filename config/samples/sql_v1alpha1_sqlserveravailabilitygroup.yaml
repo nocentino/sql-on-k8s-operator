@@ -1,4 +1,4 @@
-# SQLServerAvailabilityGroup sample — 3-replica AG with synchronous commit
+# SQLServerAvailabilityGroup sample — 3-replica AG with synchronous commit (SQL Server 2025)
 # Prerequisites:
 #   kubectl create secret generic mssql-ag-secret \
 #     --from-literal=SA_PASSWORD='YourStrong!Passw0rd'
@@ -9,7 +9,7 @@ metadata:
   namespace: default
 spec:
   agName: "AG1"
-  image: mcr.microsoft.com/mssql/server:2022-latest
+  image: mcr.microsoft.com/mssql/server:2025-latest
   edition: Developer
   acceptEula: "Y"
   saPasswordSecretRef:

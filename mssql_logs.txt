@@ -1,4 +1,0 @@
-SQL Server 2022 will run as non-root by default.
-This container is running as user mssql.
-To learn more visit https://go.microsoft.com/fwlink/?linkid=2099216.
-(null): The configuration file '/var/opt/mssql/mssql.conf' failed to load (error: Line 7: The INI file is formatted incorrectly.  The section name [sqlagent] is a duplicate.).

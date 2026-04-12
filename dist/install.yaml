@@ -1,0 +1,1465 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+    control-plane: controller-manager
+  name: sql-on-k8s-operator-system
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: sqlserveravailabilitygroups.sql.mssql.microsoft.com
+spec:
+  group: sql.mssql.microsoft.com
+  names:
+    kind: SQLServerAvailabilityGroup
+    listKind: SQLServerAvailabilityGroupList
+    plural: sqlserveravailabilitygroups
+    shortNames:
+    - sqlag
+    singular: sqlserveravailabilitygroup
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.primaryReplica
+      name: Primary
+      type: string
+    - jsonPath: .status.initializationComplete
+      name: Init
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SQLServerAvailabilityGroup is the Schema for the sqlserveravailabilitygroups API.
+          It manages an Always On Availability Group across multiple SQL Server replicas.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SQLServerAvailabilityGroupSpec defines the desired state
+              of an Always On AG.
+            properties:
+              acceptEula:
+                default: "Y"
+                description: AcceptEULA must be "Y" to accept the SQL Server EULA.
+                enum:
+                - "Y"
+                - "y"
+                type: string
+              agName:
+                description: AGName is the name of the SQL Server Availability Group
+                  (T-SQL).
+                maxLength: 128
+                type: string
+              automaticFailover:
+                description: |-
+                  AutomaticFailover configures the operator's automatic unplanned-failover behaviour.
+                  Only effective when ClusterType is EXTERNAL.
+                properties:
+                  enabled:
+                    default: true
+                    description: |-
+                      Enabled controls whether the operator will automatically promote a synchronous
+                      secondary when the primary pod is continuously NotReady for FailoverThresholdSeconds.
+                    type: boolean
+                  failoverThresholdSeconds:
+                    default: 30
+                    description: |-
+                      FailoverThresholdSeconds is how long (in seconds) the primary pod must be
+                      continuously NotReady before the operator triggers an automatic failover.
+                      Minimum 10 seconds. Defaults to 30 seconds.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                required:
+                - enabled
+                type: object
+              clusterType:
+                allOf:
+                - enum:
+                  - NONE
+                  - EXTERNAL
+                - enum:
+                  - NONE
+                  - EXTERNAL
+                default: NONE
+                description: |-
+                  ClusterType sets the SQL Server cluster type for the Availability Group.
+                  NONE means read-scale only with fully manual failover.
+                  EXTERNAL means the operator acts as the external cluster manager, enabling
+                  clean planned failover and automatic unplanned failover to synchronous replicas.
+                type: string
+              edition:
+                default: Developer
+                description: Edition is the SQL Server edition.
+                enum:
+                - Developer
+                - Express
+                - Standard
+                - Enterprise
+                - EnterpriseCore
+                type: string
+              endpointPort:
+                default: 5022
+                description: EndpointPort is the TCP port for the AG mirroring endpoint.
+                  Defaults to 5022.
+                format: int32
+                type: integer
+              image:
+                default: mcr.microsoft.com/mssql/server:2022-latest
+                description: Image is the SQL Server container image for all replicas.
+                type: string
+              listener:
+                description: |-
+                  Listener configures the read-write AG listener Service.
+                  The service selector is automatically updated to point only at the current primary replica.
+                properties:
+                  name:
+                    description: Name is the DNS name for the listener (used as the
+                      Kubernetes Service name).
+                    type: string
+                  port:
+                    default: 1433
+                    description: Port is the TCP port the listener serves on. Defaults
+                      to 1433.
+                    format: int32
+                    type: integer
+                  serviceType:
+                    default: ClusterIP
+                    description: |-
+                      ServiceType controls how the listener is exposed.
+                      ClusterIP exposes the listener inside the cluster only.
+                      NodePort exposes the listener on each node's IP at a static port.
+                      LoadBalancer provisions an external load balancer (cloud providers).
+                    enum:
+                    - ClusterIP
+                    - NodePort
+                    - LoadBalancer
+                    type: string
+                required:
+                - name
+                type: object
+              mssqlConf:
+                additionalProperties:
+                  type: string
+                description: |-
+                  MSSQLConf contains mssql.conf settings applied to all replicas.
+                  hadr.hadrenabled is automatically set to 1.
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector constrains all replica pods to nodes matching
+                  these labels.
+                type: object
+              readOnlyListener:
+                description: |-
+                  ReadOnlyListener configures a separate read-only Service for readable secondary replicas.
+                  The selector targets only pods that are currently in the SECONDARY role and have
+                  readableSecondary: true in their replica spec.
+                  ClientIP session affinity keeps each client connection pinned to the same replica
+                  for the lifetime of the connection.
+                properties:
+                  name:
+                    description: Name is the DNS name for the listener (used as the
+                      Kubernetes Service name).
+                    type: string
+                  port:
+                    default: 1433
+                    description: Port is the TCP port the listener serves on. Defaults
+                      to 1433.
+                    format: int32
+                    type: integer
+                  serviceType:
+                    default: ClusterIP
+                    description: |-
+                      ServiceType controls how the listener is exposed.
+                      ClusterIP exposes the listener inside the cluster only.
+                      NodePort exposes the listener on each node's IP at a static port.
+                      LoadBalancer provisions an external load balancer (cloud providers).
+                    enum:
+                    - ClusterIP
+                    - NodePort
+                    - LoadBalancer
+                    type: string
+                required:
+                - name
+                type: object
+              replicas:
+                description: Replicas defines the set of AG replicas (primary + secondaries).
+                items:
+                  description: AGReplicaSpec defines the desired state of one AG replica.
+                  properties:
+                    availabilityMode:
+                      default: SynchronousCommit
+                      description: AvailabilityMode controls synchronous or asynchronous
+                        commit.
+                      enum:
+                      - SynchronousCommit
+                      - AsynchronousCommit
+                      type: string
+                    failoverMode:
+                      default: Automatic
+                      description: FailoverMode controls automatic or manual failover.
+                      enum:
+                      - Automatic
+                      - Manual
+                      type: string
+                    name:
+                      description: Name is the hostname / pod name suffix for this
+                        replica (e.g. primary, secondary-1).
+                      type: string
+                    readableSecondary:
+                      description: ReadableSecondary enables secondary replicas to
+                        serve read queries.
+                      type: boolean
+                  required:
+                  - name
+                  type: object
+                maxItems: 9
+                minItems: 1
+                type: array
+              resources:
+                description: Resources defines CPU and memory requests/limits for
+                  each replica.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              saPasswordSecretRef:
+                description: SAPasswordSecretRef references the Secret containing
+                  the SA_PASSWORD key.
+                properties:
+                  key:
+                    description: The key of the secret to select from.  Must be a
+                      valid secret key.
+                    type: string
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                  optional:
+                    description: Specify whether the Secret or its key must be defined
+                    type: boolean
+                required:
+                - key
+                type: object
+                x-kubernetes-map-type: atomic
+              storage:
+                description: Storage defines PVC settings shared by all replica pods.
+                properties:
+                  accessModes:
+                    default:
+                    - ReadWriteOnce
+                    description: AccessModes defines the access mode for the PVC.
+                    items:
+                      type: string
+                    type: array
+                  dataVolumeSize:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 10Gi
+                    description: DataVolumeSize is the size of the PVC for SQL Server
+                      data and log files.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  storageClassName:
+                    description: StorageClassName is the name of the StorageClass
+                      to use (e.g. standard, managed-csi).
+                    type: string
+                type: object
+              tolerations:
+                description: Tolerations for all replica pods.
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
+            required:
+            - agName
+            - image
+            - replicas
+            - saPasswordSecretRef
+            - storage
+            type: object
+          status:
+            description: SQLServerAvailabilityGroupStatus defines the observed state
+              of the AG.
+            properties:
+              conditions:
+                description: Conditions represent the current state of the AG.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              initializationComplete:
+                description: InitializationComplete indicates whether the AG T-SQL
+                  bootstrap has completed.
+                type: boolean
+              phase:
+                description: Phase summarizes the overall lifecycle phase.
+                type: string
+              primaryNotReadySince:
+                description: |-
+                  PrimaryNotReadySince records when the current primary pod first became NotReady.
+                  The operator uses this timestamp together with AutomaticFailover.FailoverThresholdSeconds
+                  to decide when to trigger an automatic unplanned failover.
+                  Cleared when the primary recovers or after a successful failover.
+                format: date-time
+                type: string
+              primaryReplica:
+                description: PrimaryReplica is the name of the current primary replica
+                  pod.
+                type: string
+              replicaStatuses:
+                description: ReplicaStatuses holds per-replica observed state.
+                items:
+                  description: AGReplicaStatus captures the observed state of a single
+                    replica.
+                  properties:
+                    connected:
+                      description: Connected indicates whether this replica is connected
+                        to the primary.
+                      type: boolean
+                    lastSeenPrimary:
+                      description: LastSeenPrimary is the timestamp when this replica
+                        last saw a healthy primary.
+                      format: date-time
+                      type: string
+                    name:
+                      description: Name is the replica pod name.
+                      type: string
+                    role:
+                      description: Role is the current AG role (PRIMARY, SECONDARY,
+                        RESOLVING).
+                      type: string
+                    synchronizationState:
+                      description: SynchronizationState reflects the current data
+                        synchronization state.
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: sqlserverinstances.sql.mssql.microsoft.com
+spec:
+  group: sql.mssql.microsoft.com
+  names:
+    kind: SQLServerInstance
+    listKind: SQLServerInstanceList
+    plural: sqlserverinstances
+    shortNames:
+    - sqli
+    singular: sqlserverinstance
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - jsonPath: .status.currentImage
+      name: Image
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SQLServerInstance is the Schema for the sqlserverinstances API.
+          It manages the full lifecycle of a standalone SQL Server on Linux deployment.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SQLServerInstanceSpec defines the desired state of a standalone
+              SQL Server instance.
+            properties:
+              acceptEula:
+                default: "Y"
+                description: AcceptEULA indicates acceptance of the SQL Server EULA
+                  (must be "Y").
+                enum:
+                - "Y"
+                - "y"
+                type: string
+              additionalEnvVars:
+                description: AdditionalEnvVars are extra environment variables injected
+                  into the SQL Server pod.
+                items:
+                  description: EnvVar represents an environment variable present in
+                    a Container.
+                  properties:
+                    name:
+                      description: |-
+                        Name of the environment variable.
+                        May consist of any printable ASCII characters except '='.
+                      type: string
+                    value:
+                      description: |-
+                        Variable references $(VAR_NAME) are expanded
+                        using the previously defined environment variables in the container and
+                        any service environment variables. If a variable cannot be resolved,
+                        the reference in the input string will be unchanged. Double $$ are reduced
+                        to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
+                        "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
+                        Escaped references will never be expanded, regardless of whether the variable
+                        exists or not.
+                        Defaults to "".
+                      type: string
+                    valueFrom:
+                      description: Source for the environment variable's value. Cannot
+                        be used if value is not empty.
+                      properties:
+                        configMapKeyRef:
+                          description: Selects a key of a ConfigMap.
+                          properties:
+                            key:
+                              description: The key to select.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description: Specify whether the ConfigMap or its key
+                                must be defined
+                              type: boolean
+                          required:
+                          - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        fieldRef:
+                          description: |-
+                            Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
+                            spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
+                          properties:
+                            apiVersion:
+                              description: Version of the schema the FieldPath is
+                                written in terms of, defaults to "v1".
+                              type: string
+                            fieldPath:
+                              description: Path of the field to select in the specified
+                                API version.
+                              type: string
+                          required:
+                          - fieldPath
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        fileKeyRef:
+                          description: |-
+                            FileKeyRef selects a key of the env file.
+                            Requires the EnvFiles feature gate to be enabled.
+                          properties:
+                            key:
+                              description: |-
+                                The key within the env file. An invalid key will prevent the pod from starting.
+                                The keys defined within a source may consist of any printable ASCII characters except '='.
+                                During Alpha stage of the EnvFiles feature gate, the key size is limited to 128 characters.
+                              type: string
+                            optional:
+                              default: false
+                              description: |-
+                                Specify whether the file or its key must be defined. If the file or key
+                                does not exist, then the env var is not published.
+                                If optional is set to true and the specified key does not exist,
+                                the environment variable will not be set in the Pod's containers.
+
+                                If optional is set to false and the specified key does not exist,
+                                an error will be returned during Pod creation.
+                              type: boolean
+                            path:
+                              description: |-
+                                The path within the volume from which to select the file.
+                                Must be relative and may not contain the '..' path or start with '..'.
+                              type: string
+                            volumeName:
+                              description: The name of the volume mount containing
+                                the env file.
+                              type: string
+                          required:
+                          - key
+                          - path
+                          - volumeName
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        resourceFieldRef:
+                          description: |-
+                            Selects a resource of the container: only resources limits and requests
+                            (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
+                          properties:
+                            containerName:
+                              description: 'Container name: required for volumes,
+                                optional for env vars'
+                              type: string
+                            divisor:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              description: Specifies the output format of the exposed
+                                resources, defaults to "1"
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            resource:
+                              description: 'Required: resource to select'
+                              type: string
+                          required:
+                          - resource
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        secretKeyRef:
+                          description: Selects a key of a secret in the pod's namespace
+                          properties:
+                            key:
+                              description: The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description: Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                          - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              edition:
+                default: Developer
+                description: Edition is the SQL Server edition (Developer, Express,
+                  Standard, Enterprise, EnterpriseCore).
+                enum:
+                - Developer
+                - Express
+                - Standard
+                - Enterprise
+                - EnterpriseCore
+                type: string
+              image:
+                default: mcr.microsoft.com/mssql/server:2022-latest
+                description: Image is the SQL Server container image to use (e.g.
+                  mcr.microsoft.com/mssql/server:2022-latest).
+                type: string
+              mssqlConf:
+                additionalProperties:
+                  type: string
+                description: MSSQLConf contains key-value pairs written to /var/opt/mssql/mssql.conf.
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector constrains scheduling to nodes matching
+                  these labels.
+                type: object
+              port:
+                default: 1433
+                description: Port is the TCP port SQL Server listens on. Defaults
+                  to 1433.
+                format: int32
+                type: integer
+              resources:
+                description: Resources defines CPU and memory requests/limits for
+                  the SQL Server container.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              saPasswordSecretRef:
+                description: SAPasswordSecretRef references a Kubernetes Secret containing
+                  the SA_PASSWORD key.
+                properties:
+                  key:
+                    description: The key of the secret to select from.  Must be a
+                      valid secret key.
+                    type: string
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                  optional:
+                    description: Specify whether the Secret or its key must be defined
+                    type: boolean
+                required:
+                - key
+                type: object
+                x-kubernetes-map-type: atomic
+              storage:
+                description: Storage defines the persistent volume configuration for
+                  SQL Server data files.
+                properties:
+                  accessModes:
+                    default:
+                    - ReadWriteOnce
+                    description: AccessModes defines the access mode for the PVC.
+                    items:
+                      type: string
+                    type: array
+                  dataVolumeSize:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 10Gi
+                    description: DataVolumeSize is the size of the PVC for SQL Server
+                      data and log files.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  storageClassName:
+                    description: StorageClassName is the name of the StorageClass
+                      to use (e.g. standard, managed-csi).
+                    type: string
+                type: object
+              timezone:
+                description: Timezone sets the TZ environment variable for the container.
+                type: string
+              tolerations:
+                description: Tolerations allow the pod to be scheduled on tainted
+                  nodes.
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
+            required:
+            - image
+            - saPasswordSecretRef
+            - storage
+            type: object
+          status:
+            description: SQLServerInstanceStatus defines the observed state of SQLServerInstance.
+            properties:
+              conditions:
+                description: Conditions represent the current state of the SQLServerInstance
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              currentImage:
+                description: CurrentImage is the image currently running on the StatefulSet
+                  pods.
+                type: string
+              phase:
+                description: Phase summarizes the lifecycle phase of this instance
+                  (Pending, Running, Failed, Upgrading).
+                type: string
+              readyReplicas:
+                description: ReadyReplicas is the number of SQL Server pods that are
+                  ready.
+                format: int32
+                type: integer
+              serviceName:
+                description: ServiceName is the name of the headless Service for the
+                  StatefulSet.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-controller-manager
+  namespace: sql-on-k8s-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-leader-election-role
+  namespace: sql-on-k8s-operator-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sql-on-k8s-operator-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - persistentvolumeclaims
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups
+  - sqlserverinstances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups/finalizers
+  - sqlserverinstances/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups/status
+  - sqlserverinstances/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sql-on-k8s-operator-metrics-auth-role
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sql-on-k8s-operator-metrics-reader
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-sqlserveravailabilitygroup-admin-role
+rules:
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups
+  verbs:
+  - '*'
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-sqlserveravailabilitygroup-editor-role
+rules:
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-sqlserveravailabilitygroup-viewer-role
+rules:
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserveravailabilitygroups/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-sqlserverinstance-admin-role
+rules:
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserverinstances
+  verbs:
+  - '*'
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserverinstances/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-sqlserverinstance-editor-role
+rules:
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserverinstances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserverinstances/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-sqlserverinstance-viewer-role
+rules:
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserverinstances
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - sql.mssql.microsoft.com
+  resources:
+  - sqlserverinstances/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-leader-election-rolebinding
+  namespace: sql-on-k8s-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sql-on-k8s-operator-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: sql-on-k8s-operator-controller-manager
+  namespace: sql-on-k8s-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+  name: sql-on-k8s-operator-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sql-on-k8s-operator-manager-role
+subjects:
+- kind: ServiceAccount
+  name: sql-on-k8s-operator-controller-manager
+  namespace: sql-on-k8s-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sql-on-k8s-operator-metrics-auth-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sql-on-k8s-operator-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: sql-on-k8s-operator-controller-manager
+  namespace: sql-on-k8s-operator-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+    control-plane: controller-manager
+  name: sql-on-k8s-operator-controller-manager-metrics-service
+  namespace: sql-on-k8s-operator-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    app.kubernetes.io/name: sql-on-k8s-operator
+    control-plane: controller-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: sql-on-k8s-operator
+    control-plane: controller-manager
+  name: sql-on-k8s-operator-controller-manager
+  namespace: sql-on-k8s-operator-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sql-on-k8s-operator
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/name: sql-on-k8s-operator
+        control-plane: controller-manager
+    spec:
+      containers:
+      - args:
+        - --metrics-bind-address=:8443
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        command:
+        - /manager
+        image: nocentino/sql-on-k8s-operator:latest
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: manager
+        ports: []
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts: []
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: sql-on-k8s-operator-controller-manager
+      terminationGracePeriodSeconds: 10
+      volumes: []

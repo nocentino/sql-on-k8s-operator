@@ -69,6 +69,44 @@ spec:
                   (T-SQL).
                 maxLength: 128
                 type: string
+              automaticFailover:
+                description: |-
+                  AutomaticFailover configures the operator's automatic unplanned-failover behaviour.
+                  Only effective when ClusterType is EXTERNAL.
+                properties:
+                  enabled:
+                    default: true
+                    description: |-
+                      Enabled controls whether the operator will automatically promote a synchronous
+                      secondary when the primary pod is continuously NotReady for FailoverThresholdSeconds.
+                    type: boolean
+                  failoverThresholdSeconds:
+                    default: 30
+                    description: |-
+                      FailoverThresholdSeconds is how long (in seconds) the primary pod must be
+                      continuously NotReady before the operator triggers an automatic failover.
+                      Minimum 10 seconds. Defaults to 30 seconds.
+                    format: int32
+                    minimum: 10
+                    type: integer
+                required:
+                - enabled
+                type: object
+              clusterType:
+                allOf:
+                - enum:
+                  - NONE
+                  - EXTERNAL
+                - enum:
+                  - NONE
+                  - EXTERNAL
+                default: NONE
+                description: |-
+                  ClusterType sets the SQL Server cluster type for the Availability Group.
+                  NONE means read-scale only with fully manual failover.
+                  EXTERNAL means the operator acts as the external cluster manager, enabling
+                  clean planned failover and automatic unplanned failover to synchronous replicas.
+                type: string
               edition:
                 default: Developer
                 description: Edition is the SQL Server edition.
@@ -106,10 +144,14 @@ spec:
                     type: integer
                   serviceType:
                     default: ClusterIP
-                    description: ServiceType controls how the listener is exposed
-                      (ClusterIP or LoadBalancer).
+                    description: |-
+                      ServiceType controls how the listener is exposed.
+                      ClusterIP exposes the listener inside the cluster only.
+                      NodePort exposes the listener on each node's IP at a static port.
+                      LoadBalancer provisions an external load balancer (cloud providers).
                     enum:
                     - ClusterIP
+                    - NodePort
                     - LoadBalancer
                     type: string
                 required:
@@ -148,10 +190,14 @@ spec:
                     type: integer
                   serviceType:
                     default: ClusterIP
-                    description: ServiceType controls how the listener is exposed
-                      (ClusterIP or LoadBalancer).
+                    description: |-
+                      ServiceType controls how the listener is exposed.
+                      ClusterIP exposes the listener inside the cluster only.
+                      NodePort exposes the listener on each node's IP at a static port.
+                      LoadBalancer provisions an external load balancer (cloud providers).
                     enum:
                     - ClusterIP
+                    - NodePort
                     - LoadBalancer
                     type: string
                 required:
@@ -416,6 +462,14 @@ spec:
                 type: boolean
               phase:
                 description: Phase summarizes the overall lifecycle phase.
+                type: string
+              primaryNotReadySince:
+                description: |-
+                  PrimaryNotReadySince records when the current primary pod first became NotReady.
+                  The operator uses this timestamp together with AutomaticFailover.FailoverThresholdSeconds
+                  to decide when to trigger an automatic unplanned failover.
+                  Cleared when the primary recovers or after a successful failover.
+                format: date-time
                 type: string
               primaryReplica:
                 description: PrimaryReplica is the name of the current primary replica
