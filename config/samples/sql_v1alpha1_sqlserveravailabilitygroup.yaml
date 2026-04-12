@@ -31,19 +31,19 @@ spec:
   storage:
     dataVolumeSize: "20Gi"
   mssqlConf:
-    "memory.memorylimitmb": "2048"
+    "sqlagent.enabled": "true"
   # Read-write listener: always points at the current PRIMARY replica.
   # The service selector targets the pod labelled sql.mssql.microsoft.com/ag-role=primary.
   listener:
     name: mssql-ag-listener
     port: 1433
-    serviceType: ClusterIP
+    serviceType: LoadBalancer
   # Read-only listener: targets readable SECONDARY replicas with ClientIP session affinity.
   # Connections are pinned to the same replica for the duration of the session (5 min timeout).
   readOnlyListener:
     name: mssql-ag-listener-ro
     port: 1433
-    serviceType: ClusterIP
+    serviceType: LoadBalancer
   resources:
     requests:
       memory: "2Gi"

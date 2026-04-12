@@ -55,6 +55,15 @@ type SQLServerInstanceSpec struct {
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
+	// ServiceType controls how the client-facing Service is exposed.
+	// ClusterIP (default) exposes the instance inside the cluster only.
+	// NodePort exposes it on each node's IP at a static port.
+	// LoadBalancer provisions an external load balancer (cloud providers).
+	// +kubebuilder:validation:Enum=ClusterIP;NodePort;LoadBalancer
+	// +kubebuilder:default=ClusterIP
+	// +optional
+	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
+
 	// AcceptEULA indicates acceptance of the SQL Server EULA (must be "Y").
 	// +kubebuilder:validation:Enum=Y;y
 	// +kubebuilder:default=Y

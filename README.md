@@ -46,10 +46,10 @@ The operator provides two custom resources:
 
 ```sh
 # Install CRDs and deploy the controller directly from the published image
-kubectl apply -f https://raw.githubusercontent.com/anocentino/sql-on-k8s-operator/main/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/nocentino/sql-on-k8s-operator/main/dist/install.yaml
 ```
 
-The controller image (`nocentino/sql-on-k8s-operator:latest`) is available on Docker Hub for both `linux/amd64` and `linux/arm64`.
+The controller image (`nocentino/sql-on-k8s-operator:latest`) is available on Docker Hub for both `linux/amd64`.
 
 **Option B — build from source:**
 

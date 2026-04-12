@@ -15,11 +15,11 @@ spec:
     name: mssql-secret
     key: SA_PASSWORD
   port: 1433
+  serviceType: LoadBalancer
   storage:
     dataVolumeSize: "10Gi"
   mssqlConf:
-    "memory.memorylimitmb": "2048"
-    "sqlagent.enabled": "false"
+    "sqlagent.enabled": "true"
   resources:
     requests:
       memory: "2Gi"

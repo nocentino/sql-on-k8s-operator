@@ -376,12 +376,17 @@ func (r *SQLServerInstanceReconciler) buildHeadlessService(instance *sqlv1alpha1
 	}
 }
 
-// buildClusterIPService creates the ClusterIP Service for client access to SQL Server.
+// buildClientService creates the client-facing Service for SQL Server access.
+// The service type defaults to ClusterIP but respects spec.serviceType when set.
 func (r *SQLServerInstanceReconciler) buildClusterIPService(instance *sqlv1alpha1.SQLServerInstance) *corev1.Service {
 	labels := map[string]string{"app": instance.Name}
 	port := instance.Spec.Port
 	if port == 0 {
 		port = 1433
+	}
+	svcType := instance.Spec.ServiceType
+	if svcType == "" {
+		svcType = corev1.ServiceTypeClusterIP
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -390,7 +395,7 @@ func (r *SQLServerInstanceReconciler) buildClusterIPService(instance *sqlv1alpha
 			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     corev1.ServiceTypeClusterIP,
+			Type:     svcType,
 			Selector: labels,
 			Ports: []corev1.ServicePort{
 				{Name: "mssql", Port: port, TargetPort: intstr.FromInt32(port)},

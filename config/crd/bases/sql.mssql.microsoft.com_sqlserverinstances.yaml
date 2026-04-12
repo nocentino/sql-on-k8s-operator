@@ -340,6 +340,18 @@ spec:
                 - key
                 type: object
                 x-kubernetes-map-type: atomic
+              serviceType:
+                default: ClusterIP
+                description: |-
+                  ServiceType controls how the client-facing Service is exposed.
+                  ClusterIP (default) exposes the instance inside the cluster only.
+                  NodePort exposes it on each node's IP at a static port.
+                  LoadBalancer provisions an external load balancer (cloud providers).
+                enum:
+                - ClusterIP
+                - NodePort
+                - LoadBalancer
+                type: string
               storage:
                 description: Storage defines the persistent volume configuration for
                   SQL Server data files.
