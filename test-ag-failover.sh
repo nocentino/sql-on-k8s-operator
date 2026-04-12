@@ -113,12 +113,53 @@ sqlcmd_pod_port() {
 
 # ── Teardown helper (called at start of deploy for a clean slate) ─────────────
 teardown_ag() {
-    info "Teardown — removing any existing AG CR, SQL Server AG, and data volumes"
+    info "Teardown — checking for existing AG CR and data volumes"
+
+    # Detect whether anything exists that requires teardown.
+    local cr_exists=false pod_exists=false
+    kubectl get sqlag "${AG_NAME}" &>/dev/null  && cr_exists=true
+    kubectl get pod  "${AG_NAME}-0" &>/dev/null && pod_exists=true
+
+    if [[ "$cr_exists" == false && "$pod_exists" == false ]]; then
+        info "  No existing AG found — skipping teardown"
+        return 0
+    fi
+
+    # Something exists — prompt the user before destroying it.
+    echo -e "\n${YELLOW}  ┌─ Existing AG detected ──────────────────────────────────${NC}"
+    [[ "$cr_exists"  == true ]] && echo -e "  │  CR:   ${AG_NAME} (kubectl get sqlag ${AG_NAME})"
+    [[ "$pod_exists" == true ]] && echo -e "  │  Pods: ${AG_NAME}-0 … (and associated PVCs)"
+    echo -e "  │"
+    echo -e "  │  Teardown will:"
+    echo -e "  │    • Delete the SQLServerAvailabilityGroup CR"
+    echo -e "  │    • Delete all mssql-data-${AG_NAME}-* PVCs  ← data loss"
+    echo -e "  ${YELLOW}└─────────────────────────────────────────────────────────${NC}\n"
+
+    local answer=""
+    if [[ "${FORCE_TEARDOWN:-0}" == "1" ]]; then
+        # Unattended CI path: caller explicitly opted in via env var.
+        answer="y"
+        warn "  FORCE_TEARDOWN=1 — skipping prompt and proceeding with teardown"
+    elif [[ -t 0 ]]; then
+        # Interactive terminal: show the prompt on the terminal itself.
+        read -r -p "  Proceed with teardown? [y/N] " answer </dev/tty
+    else
+        # Piped stdin (e.g. echo "y" | ./test-ag-failover.sh deploy):
+        # read whatever was sent; if nothing was sent default to "n" (safe).
+        read -r answer 2>/dev/null || true
+        [[ -z "$answer" ]] && answer="n"
+        info "  Non-interactive: received '${answer}'"
+    fi
+
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        warn "Teardown cancelled — exiting without making changes"
+        return 0
+    fi
 
     # Step 1: If pods are running, drop the SQL Server AG *first* (while we can still connect).
     # This prevents the operator from skipping CREATE on re-bootstrap because it found
     # a leftover AG (potentially with a different CLUSTER_TYPE) in the SQL Server data files.
-    if kubectl get pod "${AG_NAME}-0" &>/dev/null; then
+    if [[ "$pod_exists" == true ]]; then
         info "  Dropping SQL Server AG [${AG_SQL_NAME}] from primary pod..."
         kubectl exec "${AG_NAME}-0" -- /opt/mssql-tools18/bin/sqlcmd \
             -S "localhost,1433" -U sa -P "${SA_PASSWORD}" -No -C \
@@ -127,7 +168,7 @@ teardown_ag() {
     fi
 
     # Step 2: Delete the CR (triggers StatefulSet GC → pods terminate; PVCs are retained).
-    if kubectl get sqlag "${AG_NAME}" &>/dev/null; then
+    if [[ "$cr_exists" == true ]]; then
         kubectl delete sqlag "${AG_NAME}" --ignore-not-found 2>&1
         info "  Waiting for pods to terminate..."
         kubectl wait pod -l "app=${AG_NAME}" --for=delete --timeout=120s 2>/dev/null || true

@@ -247,7 +247,7 @@ The K8s layer (pod readiness and `ag-role` label) and the SQL layer (role, sync 
 | After unplanned failover — new primary elected | Crashed pod `NOT_HEALTHY` | `RESOLVING` while SQL Server rejoins |
 | After crashed pod recovered | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
 
-> **Note on the async replica (`mssql-ag-2`):** its steady-state `SyncState` is always `SYNCHRONIZING`, never `SYNCHRONIZED`. This is correct behaviour for `AsynchronousCommit` — the replica continuously applies log as it arrives rather than holding transactions until the secondary acknowledges. The script only waits for the **synchronous** replica to reach `SYNCHRONIZED` before declaring the final health check.
+> **Note on the async replica (`mssql-ag-2`):** its steady-state `SyncState` is always `SYNCHRONIZING`, never `SYNCHRONIZED`. This is correct behavior for `AsynchronousCommit` — the replica continuously applies log as it arrives rather than holding transactions until the secondary acknowledges. The script only waits for the **synchronous** replica to reach `SYNCHRONIZED` before declaring the final health check.
 
 ## API Reference
 
