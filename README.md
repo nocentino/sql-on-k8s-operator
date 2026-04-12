@@ -2,6 +2,19 @@
 
 A Kubernetes operator for **SQL Server on Linux** that automates the full lifecycle of standalone instances and Always On Availability Groups (AG).
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Quick Start](#quick-start)
+- [Automatic Failover](#automatic-failover)
+- [API Reference](#api-reference)
+- [Testing Failover](#testing-failover)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Uninstall](#uninstall)
+
+
+
 ## Overview
 
 The operator provides two custom resources:
@@ -11,7 +24,7 @@ The operator provides two custom resources:
 | `SQLServerInstance` | `sql.mssql.microsoft.com/v1alpha1` | Standalone SQL Server — one pod, one PVC, one Service |
 | `SQLServerAvailabilityGroup` | `sql.mssql.microsoft.com/v1alpha1` | Multi-replica AG with automatic T-SQL bootstrap, certificate-based endpoint auth, and read-write / read-only listener Services |
 
-### What the operator manages
+### What the operator manages:
 
 **SQLServerInstance** — for each CR the operator creates and reconciles:
 - A `ConfigMap` containing `mssql.conf` (memory limits, SQL Agent, arbitrary settings)
@@ -30,15 +43,15 @@ The operator provides two custom resources:
 - Per-replica status (role, synchronization state, connected)
 - **Automatic unplanned failover** (when `clusterType: EXTERNAL`) — the operator promotes the best synchronous secondary when the primary pod is continuously unhealthy beyond a configurable threshold
 
-## Prerequisites
+## Quick Start
+
+### Prerequisites
 
 - Go **1.25+**
 - Docker **17.03+** (or compatible container runtime)
 - kubectl **v1.11.3+**
 - A Kubernetes **v1.11.3+** cluster
 - [cert-manager](https://cert-manager.io/) is **not** required — the operator manages its own certificates
-
-## Quick Start
 
 ### 1. Deploy the operator
 
@@ -76,36 +89,12 @@ kubectl apply -f config/samples/sql_v1alpha1_sqlserverinstance.yaml
 
 # Watch until Available
 kubectl get sqli mssql-standalone -w
+
+# Connect (Docker Desktop exposes LoadBalancer services on localhost)
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd'
 ```
 
-Sample CR (`config/samples/sql_v1alpha1_sqlserverinstance.yaml`):
-
-```yaml
-apiVersion: sql.mssql.microsoft.com/v1alpha1
-kind: SQLServerInstance
-metadata:
-  name: mssql-standalone
-  namespace: default
-spec:
-  image: mcr.microsoft.com/mssql/server:2025-latest
-  edition: Developer
-  acceptEula: "Y"
-  saPasswordSecretRef:
-    name: mssql-secret
-    key: SA_PASSWORD
-  port: 1433
-  storage:
-    dataVolumeSize: "10Gi"
-  mssqlConf:
-    "memory.memorylimitmb": "2048"
-  resources:
-    requests:
-      memory: "2Gi"
-      cpu: "500m"
-    limits:
-      memory: "4Gi"
-      cpu: "2"
-```
+The full annotated sample CR is at [`config/samples/sql_v1alpha1_sqlserverinstance.yaml`](config/samples/sql_v1alpha1_sqlserverinstance.yaml). Key fields are documented in the [API Reference](#api-reference).
 
 ### 3. Create an Availability Group
 
@@ -119,195 +108,13 @@ kubectl apply -f config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml
 
 # Watch bootstrap — initializationComplete flips to true when the AG is ready
 kubectl get sqlag mssql-ag -w
+
+# Connect via the read-write listener
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' \
+  -Q "SELECT @@SERVERNAME, role_desc FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1"
 ```
 
-Sample CR (`config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml`):
-
-```yaml
-apiVersion: sql.mssql.microsoft.com/v1alpha1
-kind: SQLServerAvailabilityGroup
-metadata:
-  name: mssql-ag
-  namespace: default
-spec:
-  agName: "AG1"
-  image: mcr.microsoft.com/mssql/server:2025-latest
-  edition: Developer
-  acceptEula: "Y"
-  saPasswordSecretRef:
-    name: mssql-ag-secret
-    key: SA_PASSWORD
-  endpointPort: 5022
-  replicas:
-    - name: primary
-      availabilityMode: SynchronousCommit
-      failoverMode: Automatic
-    - name: secondary-1
-      availabilityMode: SynchronousCommit
-      failoverMode: Automatic
-      readableSecondary: true
-    - name: secondary-2
-      availabilityMode: AsynchronousCommit
-      failoverMode: Manual
-      readableSecondary: true
-  storage:
-    dataVolumeSize: "20Gi"
-  mssqlConf:
-    "memory.memorylimitmb": "2048"
-  listener:
-    name: mssql-ag-listener
-    port: 1433
-    serviceType: ClusterIP
-  readOnlyListener:
-    name: mssql-ag-listener-ro
-    port: 1433
-    serviceType: ClusterIP
-  resources:
-    requests:
-      memory: "2Gi"
-      cpu: "500m"
-    limits:
-      memory: "4Gi"
-      cpu: "2"
-```
-
-## Example Workflow — AG Failover Testing
-
-A self-contained test script, `test-ag-failover.sh`, ships with the repository. It deploys a three-replica AG, seeds a test database, and exercises both planned and unplanned automatic failover end-to-end with health checks at every state transition.
-
-### Prerequisites
-
-- `kubectl` pointed at a cluster with the operator already deployed (see [Quick Start](#quick-start))
-- `sqlcmd` on your PATH — install via [mssql-tools18](https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-setup-tools)
-- `python3` for JSON pretty-printing of operator status
-
-### Phases
-
-The script is composed of five independent phases that can be run individually or all at once:
-
-| Phase | Command | What it does |
-|---|---|---|
-| 1 — Deploy | `deploy` | Tears down any existing AG (drops the SQL Server AG, deletes the CR and PVCs for a clean slate), creates the SA password secret, applies the sample CR, and waits for all pods to be Ready |
-| 2 — Verify | `verify` | Waits for bootstrap to complete (`InitializationComplete=true`), shows pod labels, listener services, and an initial replica health snapshot |
-| 3 — Add database | `adddb` | Creates `testdb`, backs it up, adds it to the AG, waits for all synchronous replicas to reach `HEALTHY`; shows health snapshots before and after seeding |
-| 4 — Planned failover | `planned` | Auto-detects the first synchronous secondary, port-forwards to it, issues `ALTER AVAILABILITY GROUP FAILOVER` with the required external-cluster session context, waits for the operator to update `status.primaryReplica`, and shows three health snapshots (pre-DDL, mid-transition, settled) |
-| 5 — Unplanned failover | `unplanned` | Sends `SIGKILL` to `sqlservr` inside the primary pod to simulate a crash, watches the operator timer count down, confirms promotion of the new primary, waits for the crashed pod to rejoin as a synchronous secondary and reach `SYNCHRONIZED`, then shows a final all-clear health snapshot |
-
-### Running the full test
-
-```bash
-# Make the script executable (first time only)
-chmod +x test-ag-failover.sh
-
-# Run all five phases in order
-./test-ag-failover.sh all
-
-# Or run phases individually
-./test-ag-failover.sh deploy
-./test-ag-failover.sh verify
-./test-ag-failover.sh adddb
-./test-ag-failover.sh planned
-./test-ag-failover.sh unplanned
-```
-
-Override the SA password if yours differs from the default:
-
-```bash
-SA_PASSWORD='MyPassword!' ./test-ag-failover.sh all
-```
-
-### Health check output
-
-At each state transition the script prints a labelled box showing both layers of the health model side by side:
-
-```
-  ┌─ Pre-planned-failover snapshot
-  │  Pod mssql-ag-0   k8s-ready=true   ag-role=primary
-  │  Pod mssql-ag-1   k8s-ready=true   ag-role=readable-secondary
-  │  Pod mssql-ag-2   k8s-ready=true   ag-role=readable-secondary
-  │
-  │  Replica     Role       SyncHealth  SyncState    LogSendQ_KB  RedoQ_KB
-  │  mssql-ag-0  PRIMARY    HEALTHY     n/a          n/a          n/a
-  │  mssql-ag-1  SECONDARY  HEALTHY     SYNCHRONIZED 0            0
-  │  mssql-ag-2  SECONDARY  HEALTHY     SYNCHRONIZING 0           0
-  └─────────────────────────────────────────────────────────────────────
-```
-
-The K8s layer (pod readiness and `ag-role` label) and the SQL layer (role, sync health, sync state, queue depths) are shown together so you can see at a glance whether any lag exists between what Kubernetes reports and what SQL Server reports.
-
-### What to look for
-
-| Transition | Expected `SyncHealth` | Expected `SyncState` |
-|---|---|---|
-| Initial baseline (empty AG) | `NOT_HEALTHY` | `n/a` — no databases yet |
-| After `ADD DATABASE`, seeding in progress | Primary `HEALTHY`; secondaries `NOT_HEALTHY` | `NOT SYNCHRONIZING` → `SYNCHRONIZING` |
-| After seeding complete | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
-| Immediately after planned `FAILOVER` DDL | Old primary `NOT_HEALTHY` | `n/a` — mid-transition, listener re-pointing |
-| Planned failover settled | All `HEALTHY` | New primary; old primary `SYNCHRONIZED` |
-| After unplanned failover — new primary elected | Crashed pod `NOT_HEALTHY` | `RESOLVING` while SQL Server rejoins |
-| After crashed pod recovered | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
-
-> **Note on the async replica (`mssql-ag-2`):** its steady-state `SyncState` is always `SYNCHRONIZING`, never `SYNCHRONIZED`. This is correct behavior for `AsynchronousCommit` — the replica continuously applies log as it arrives rather than holding transactions until the secondary acknowledges. The script only waits for the **synchronous** replica to reach `SYNCHRONIZED` before declaring the final health check.
-
-## API Reference
-
-### SQLServerInstance spec fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `image` | string | `mcr.microsoft.com/mssql/server:2025-latest` | SQL Server container image |
-| `edition` | string | `Developer` | `Developer`, `Express`, `Standard`, `Enterprise`, `EnterpriseCore` |
-| `acceptEula` | string | `Y` | Must be `Y` to accept the SQL Server EULA |
-| `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
-| `port` | int32 | `1433` | TCP port SQL Server listens on |
-| `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size for data and log files |
-| `storage.storageClassName` | string | — | StorageClass name (cluster default if omitted) |
-| `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` |
-| `resources` | ResourceRequirements | — | CPU and memory requests/limits |
-| `timezone` | string | — | TZ environment variable for the container |
-| `additionalEnvVars` | []EnvVar | — | Extra environment variables injected into the pod |
-
-### SQLServerAvailabilityGroup spec fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `agName` | string | — | T-SQL name of the Availability Group |
-| `image` | string | `mcr.microsoft.com/mssql/server:2025-latest` | SQL Server container image (all replicas) |
-| `edition` | string | `Developer` | SQL Server edition |
-| `acceptEula` | string | `Y` | Must be `Y` |
-| `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
-| `endpointPort` | int32 | `5022` | TCP port for the AG mirroring endpoint |
-| `replicas` | []AGReplicaSpec | — | 1–9 replica definitions (see below) |
-| `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size per replica |
-| `storage.storageClassName` | string | — | StorageClass name |
-| `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` on every replica; `hadr.hadrenabled=1` is always set automatically |
-| `clusterType` | string | `NONE` | AG cluster type: `NONE` (read-scale, manual failover) or `EXTERNAL` (operator-managed, enables automatic failover) |
-| `automaticFailover.enabled` | bool | `true` | Promote a synchronous secondary automatically when the primary is unhealthy (requires `clusterType: EXTERNAL`) |
-| `automaticFailover.failoverThresholdSeconds` | int32 | `30` | Seconds the primary must be continuously unhealthy before an automatic failover is triggered (minimum 10) |
-| `automaticFailover.healthThreshold` | string | `system` | SQL Server internal health sensitivity: `system` (default), `resource`, or `query_processing` — see [Automatic Failover](#automatic-failover) |
-| `listener` | ListenerSpec | — | Read-write Service pointing at the current PRIMARY |
-| `readOnlyListener` | ListenerSpec | — | Read-only Service pointing at readable SECONDARY replicas |
-| `resources` | ResourceRequirements | — | CPU and memory requests/limits per replica |
-| `nodeSelector` | map[string]string | — | Node label constraints for all replica pods |
-| `tolerations` | []Toleration | — | Pod tolerations for all replica pods |
-
-**AGReplicaSpec fields:**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `name` | string | — | Replica name (used as the pod name suffix) |
-| `availabilityMode` | string | `SynchronousCommit` | `SynchronousCommit` or `AsynchronousCommit` |
-| `failoverMode` | string | `Automatic` | `Automatic` or `Manual` |
-| `readableSecondary` | bool | `false` | Allow read queries on this secondary (`SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)`) |
-
-### SQLServerAvailabilityGroup status fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `initializationComplete` | bool | `true` once the AG T-SQL bootstrap has completed |
-| `primaryReplica` | string | Pod name of the current PRIMARY replica |
-| `phase` | string | Overall lifecycle phase |
-| `replicaStatuses` | []AGReplicaStatus | Per-replica role, synchronization state, and connectivity |
+The full annotated sample CR is at [`config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml`](config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml). The sample configures a three-replica AG (`clusterType: EXTERNAL`) with two synchronous replicas and one asynchronous replica, LoadBalancer listeners, and SQL Agent enabled. Key fields are documented in the [API Reference](#api-reference).
 
 ## Automatic Failover
 
@@ -414,15 +221,288 @@ ALTER AVAILABILITY GROUP [AG1]
 | T+~60 s | Killed pod restarts; re-joins as `RESOLVING` |
 | T+~90 s | Operator issues `SET (ROLE = SECONDARY)`; full synchronization resumes |
 
-## Uninstall
+## API Reference
+
+### SQLServerInstance spec fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `image` | string | `mcr.microsoft.com/mssql/server:2025-latest` | SQL Server container image |
+| `edition` | string | `Developer` | `Developer`, `Express`, `Standard`, `Enterprise`, `EnterpriseCore` |
+| `acceptEula` | string | `Y` | Must be `Y` to accept the SQL Server EULA |
+| `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
+| `port` | int32 | `1433` | TCP port SQL Server listens on |
+| `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size for data and log files |
+| `storage.storageClassName` | string | — | StorageClass name (cluster default if omitted) |
+| `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` |
+| `resources` | ResourceRequirements | — | CPU and memory requests/limits |
+| `timezone` | string | — | TZ environment variable for the container |
+| `additionalEnvVars` | []EnvVar | — | Extra environment variables injected into the pod |
+
+### SQLServerAvailabilityGroup spec fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agName` | string | — | T-SQL name of the Availability Group |
+| `image` | string | `mcr.microsoft.com/mssql/server:2025-latest` | SQL Server container image (all replicas) |
+| `edition` | string | `Developer` | SQL Server edition |
+| `acceptEula` | string | `Y` | Must be `Y` |
+| `saPasswordSecretRef` | SecretKeySelector | — | Secret containing the `SA_PASSWORD` key |
+| `endpointPort` | int32 | `5022` | TCP port for the AG mirroring endpoint |
+| `replicas` | []AGReplicaSpec | — | 1–9 replica definitions (see below) |
+| `storage.dataVolumeSize` | Quantity | `10Gi` | PVC size per replica |
+| `storage.storageClassName` | string | — | StorageClass name |
+| `mssqlConf` | map[string]string | — | Key-value pairs written to `mssql.conf` on every replica; `hadr.hadrenabled=1` is always set automatically |
+| `clusterType` | string | `NONE` | AG cluster type: `NONE` (read-scale, manual failover) or `EXTERNAL` (operator-managed, enables automatic failover) |
+| `automaticFailover.enabled` | bool | `true` | Promote a synchronous secondary automatically when the primary is unhealthy (requires `clusterType: EXTERNAL`) |
+| `automaticFailover.failoverThresholdSeconds` | int32 | `30` | Seconds the primary must be continuously unhealthy before an automatic failover is triggered (minimum 10) |
+| `automaticFailover.healthThreshold` | string | `system` | SQL Server internal health sensitivity: `system` (default), `resource`, or `query_processing` — see [Automatic Failover](#automatic-failover) |
+| `listener` | ListenerSpec | — | Read-write Service pointing at the current PRIMARY |
+| `readOnlyListener` | ListenerSpec | — | Read-only Service pointing at readable SECONDARY replicas |
+| `resources` | ResourceRequirements | — | CPU and memory requests/limits per replica |
+| `nodeSelector` | map[string]string | — | Node label constraints for all replica pods |
+| `tolerations` | []Toleration | — | Pod tolerations for all replica pods |
+
+**AGReplicaSpec fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | — | Replica name (used as the pod name suffix) |
+| `availabilityMode` | string | `SynchronousCommit` | `SynchronousCommit` or `AsynchronousCommit` |
+| `failoverMode` | string | `Automatic` | `Automatic` or `Manual` |
+| `readableSecondary` | bool | `false` | Allow read queries on this secondary (`SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)`) |
+
+### SQLServerAvailabilityGroup status fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `initializationComplete` | bool | `true` once the AG T-SQL bootstrap has completed |
+| `primaryReplica` | string | Pod name of the current PRIMARY replica |
+| `phase` | string | Overall lifecycle phase |
+| `replicaStatuses` | []AGReplicaStatus | Per-replica role, synchronization state, and connectivity |
+
+## Testing Failover
+
+A self-contained test script, `test-ag-failover.sh`, ships with the repository. It deploys a three-replica AG, seeds a test database, and exercises both planned and unplanned automatic failover end-to-end with health checks at every state transition.
+
+### Prerequisites
+
+- `kubectl` pointed at a cluster with the operator already deployed (see [Quick Start](#quick-start))
+- `sqlcmd` on your PATH — install via [mssql-tools18](https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-setup-tools)
+- `python3` for JSON pretty-printing of operator status
+
+### Phases
+
+The script is composed of five independent phases that can be run individually or all at once:
+
+| Phase | Command | What it does |
+|---|---|---|
+| 1 — Deploy | `deploy` | Tears down any existing AG (drops the SQL Server AG, deletes the CR and PVCs for a clean slate), creates the SA password secret, applies the sample CR, and waits for all pods to be Ready |
+| 2 — Verify | `verify` | Waits for bootstrap to complete (`InitializationComplete=true`), shows pod labels, listener services, and an initial replica health snapshot |
+| 3 — Add database | `adddb` | Creates `testdb`, backs it up, adds it to the AG, waits for all synchronous replicas to reach `HEALTHY`; shows health snapshots before and after seeding |
+| 4 — Planned failover | `planned` | Auto-detects the first synchronous secondary, port-forwards to it, issues `ALTER AVAILABILITY GROUP FAILOVER` with the required external-cluster session context, waits for the operator to update `status.primaryReplica`, and shows three health snapshots (pre-DDL, mid-transition, settled) |
+| 5 — Unplanned failover | `unplanned` | Sends `SIGKILL` to `sqlservr` inside the primary pod to simulate a crash, watches the operator timer count down, confirms promotion of the new primary, waits for the crashed pod to rejoin as a synchronous secondary and reach `SYNCHRONIZED`, then shows a final all-clear health snapshot |
+
+### Running the full test
+
+```bash
+# Make the script executable (first time only)
+chmod +x test-ag-failover.sh
+
+# Run all five phases in order
+./test-ag-failover.sh all
+
+# Or run phases individually
+./test-ag-failover.sh deploy
+./test-ag-failover.sh verify
+./test-ag-failover.sh adddb
+./test-ag-failover.sh planned
+./test-ag-failover.sh unplanned
+```
+
+Override the SA password if yours differs from the default:
+
+```bash
+SA_PASSWORD='MyPassword!' ./test-ag-failover.sh all
+```
+
+### Health check output
+
+At each state transition the script prints a labelled box showing both layers of the health model side by side:
+
+```
+  ┌─ Pre-planned-failover snapshot
+  │  Pod mssql-ag-0   k8s-ready=true   ag-role=primary
+  │  Pod mssql-ag-1   k8s-ready=true   ag-role=readable-secondary
+  │  Pod mssql-ag-2   k8s-ready=true   ag-role=readable-secondary
+  │
+  │  Replica     Role       SyncHealth  SyncState    LogSendQ_KB  RedoQ_KB
+  │  mssql-ag-0  PRIMARY    HEALTHY     n/a          n/a          n/a
+  │  mssql-ag-1  SECONDARY  HEALTHY     SYNCHRONIZED 0            0
+  │  mssql-ag-2  SECONDARY  HEALTHY     SYNCHRONIZING 0           0
+  └─────────────────────────────────────────────────────────────────────
+```
+
+The K8s layer (pod readiness and `ag-role` label) and the SQL layer (role, sync health, sync state, queue depths) are shown together so you can see at a glance whether any lag exists between what Kubernetes reports and what SQL Server reports.
+
+### What to look for
+
+| Transition | Expected `SyncHealth` | Expected `SyncState` |
+|---|---|---|
+| Initial baseline (empty AG) | `NOT_HEALTHY` | `n/a` — no databases yet |
+| After `ADD DATABASE`, seeding in progress | Primary `HEALTHY`; secondaries `NOT_HEALTHY` | `NOT SYNCHRONIZING` → `SYNCHRONIZING` |
+| After seeding complete | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
+| Immediately after planned `FAILOVER` DDL | Old primary `NOT_HEALTHY` | `n/a` — mid-transition, listener re-pointing |
+| Planned failover settled | All `HEALTHY` | New primary; old primary `SYNCHRONIZED` |
+| After unplanned failover — new primary elected | Crashed pod `NOT_HEALTHY` | `RESOLVING` while SQL Server rejoins |
+| After crashed pod recovered | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
+
+> **Note on the async replica (`mssql-ag-2`):** its steady-state `SyncState` is always `SYNCHRONIZING`, never `SYNCHRONIZED`. This is correct behavior for `AsynchronousCommit` — the replica continuously applies log as it arrives rather than holding transactions until the secondary acknowledges. The script only waits for the **synchronous** replica to reach `SYNCHRONIZED` before declaring the final health check.
+
+## Troubleshooting
+
+### Operator
 
 ```sh
-# Remove CRs
-kubectl delete -k config/samples/
+# Stream operator logs
+kubectl logs -n sql-on-k8s-operator-system \
+  deployment/sql-on-k8s-operator-controller-manager -f
 
-# Remove the controller and CRDs
-make undeploy
-make uninstall
+# Filter for errors and reconcile decisions
+kubectl logs -n sql-on-k8s-operator-system \
+  deployment/sql-on-k8s-operator-controller-manager --since=10m \
+  | grep -E "ERROR|error|Failover|NotReady|threshold|bootstrap|InitializationComplete"
+
+# Check the operator pod itself (ImagePullBackOff, CrashLoopBackOff, etc.)
+kubectl describe pod -n sql-on-k8s-operator-system \
+  -l control-plane=controller-manager
+```
+
+### Standalone instance
+
+```sh
+# Check CR status conditions
+kubectl get sqli mssql-standalone -o yaml | grep -A 20 "^status:"
+
+# Check the StatefulSet and pod
+kubectl describe statefulset mssql-standalone
+kubectl describe pod mssql-standalone-0
+
+# Check PVC binding (pod stuck Pending = unbound PVC)
+kubectl get pvc -l app=mssql-standalone
+
+# Check mssql.conf that was applied
+kubectl get configmap mssql-standalone-mssql-conf -o yaml
+```
+
+### Availability Group — bootstrap
+
+```sh
+# Watch initializationComplete and primaryReplica
+kubectl get sqlag mssql-ag -o jsonpath='{.status}' | python3 -m json.tool
+
+# Check pod readiness and ag-role labels (operator sets these during bootstrap)
+kubectl get pods -l app=mssql-ag \
+  -o custom-columns='POD:.metadata.name,READY:.status.containerStatuses[0].ready,ROLE:.metadata.labels.sql\.mssql\.microsoft\.com/ag-role'
+
+# Check events for a specific pod (image pull failures, probe failures, etc.)
+kubectl describe pod mssql-ag-0 | grep -A 20 "^Events:"
+
+# Check which SQL Server AG cluster type is actually configured
+# (NONE vs EXTERNAL — mismatch causes FAILOVER DDL to be rejected)
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' \
+  -Q "SELECT name, cluster_type_desc FROM sys.availability_groups"
+```
+
+### Availability Group — synchronization health
+
+```sh
+# Full replica health: role, sync state, and queue depths
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' -Q \
+  "SELECT r.replica_server_name, rs.role_desc,
+          rs.synchronization_health_desc,
+          drs.synchronization_state_desc,
+          drs.log_send_queue_size, drs.redo_queue_size
+   FROM sys.dm_hadr_availability_replica_states rs
+   JOIN sys.availability_replicas r ON rs.replica_id = r.replica_id
+   LEFT JOIN sys.dm_hadr_database_replica_states drs
+       ON rs.replica_id = drs.replica_id AND drs.is_local = 0
+   ORDER BY rs.role_desc, r.replica_server_name"
+
+# Check automatic seeding progress (rows disappear when seeding completes)
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' -Q \
+  "SELECT r.replica_server_name, das.current_state,
+          das.failure_state_desc, das.transferred_size_bytes
+   FROM sys.dm_hadr_automatic_seeding das
+   JOIN sys.availability_replicas r ON das.remote_id = r.replica_id"
+
+# Check per-database sync state and whether data movement is suspended
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' -Q \
+  "SELECT r.replica_server_name, adc.database_name,
+          drs.synchronization_state_desc, drs.is_suspended,
+          drs.suspend_reason_desc
+   FROM sys.dm_hadr_database_replica_states drs
+   JOIN sys.availability_replicas r ON drs.replica_id = r.replica_id
+   JOIN sys.availability_databases_cluster adc
+       ON drs.group_database_id = adc.group_database_id"
+
+# Connect directly to a specific pod (bypass the listener)
+kubectl port-forward pod/mssql-ag-1 14331:1433 &
+sqlcmd -S localhost,14331 -U sa -P 'YourStrong!Passw0rd' \
+  -Q "SELECT @@SERVERNAME, role_desc FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1"
+kill %1
+```
+
+### Availability Group — failover
+
+```sh
+# Failover rejected with error 41142 = target was not synchronized at the time of the crash.
+# The operator retries on the next reconcile. Check which replicas are candidates:
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' -Q \
+  "SELECT r.replica_server_name, r.availability_mode_desc,
+          r.failover_mode_desc, rs.synchronization_health_desc
+   FROM sys.availability_replicas r
+   JOIN sys.dm_hadr_availability_replica_states rs ON r.replica_id = rs.replica_id
+   WHERE r.availability_mode_desc = 'SYNCHRONOUS_COMMIT'
+     AND r.failover_mode_desc     = 'AUTOMATIC'"
+
+# RESOLVING replicas after unplanned failover = operator has not yet run SET ROLE = SECONDARY.
+# This clears automatically on the next reconcile. Check current status:
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' -Q \
+  "SELECT r.replica_server_name, rs.role_desc, rs.operational_state_desc
+   FROM sys.dm_hadr_availability_replica_states rs
+   JOIN sys.availability_replicas r ON rs.replica_id = r.replica_id
+   WHERE rs.role_desc = 'RESOLVING'"
+```
+
+### Services and connectivity
+
+```sh
+# Check listener services and their selectors
+kubectl get svc -l app=mssql-ag -o wide
+
+# Check which pod the listener is pointing at (selector must match the PRIMARY pod's labels)
+kubectl get svc mssql-ag-listener -o jsonpath='{.spec.selector}' | python3 -m json.tool
+
+# LoadBalancer EXTERNAL-IP stuck as <pending> — normal on bare-metal without MetalLB;
+# on Docker Desktop it appears as 'localhost' automatically.
+kubectl get svc mssql-ag-listener
+
+# Force a reconcile to correct drifted service types or selector mismatches
+kubectl annotate sqlag mssql-ag reconcile-trigger="$(date +%s)" --overwrite
+```
+
+### CRD schema errors
+
+```sh
+# "unknown field" on kubectl apply = cluster is running the old CRD schema.
+# Re-apply the generated CRD after any change to *_types.go:
+kubectl apply -f config/crd/bases/sql.mssql.microsoft.com_sqlserveravailabilitygroups.yaml
+kubectl apply -f config/crd/bases/sql.mssql.microsoft.com_sqlserverinstances.yaml
+
+# Verify the CRD version the cluster is running
+kubectl get crd sqlserveravailabilitygroups.sql.mssql.microsoft.com \
+  -o jsonpath='{.metadata.resourceVersion}'
 ```
 
 ## Development
@@ -445,6 +525,17 @@ make run
 ```
 
 Run `make help` for the full list of available targets.
+
+## Uninstall
+
+```sh
+# Remove CRs
+kubectl delete -k config/samples/
+
+# Remove the controller and CRDs
+make undeploy
+make uninstall
+```
 
 ## License
 
