@@ -54,8 +54,14 @@ spec:
           metadata:
             type: object
           spec:
-            description: SQLServerAvailabilityGroupSpec defines the desired state
-              of an Always On AG.
+            description: |-
+              SQLServerAvailabilityGroupSpec defines the desired state of an Always On AG.
+
+              Cross-field validation rules:
+                - automaticFailover requires clusterType EXTERNAL (the operator can only issue
+                  ALTER AVAILABILITY GROUP FAILOVER when acting as the external cluster manager).
+                - failoverMode Automatic on any replica requires clusterType EXTERNAL (SQL Server
+                  only honours Automatic failover mode when an external cluster manager is present).
             properties:
               acceptEula:
                 default: "Y"
@@ -414,6 +420,14 @@ spec:
             - saPasswordSecretRef
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: 'automaticFailover requires clusterType: EXTERNAL'
+              rule: '!has(self.automaticFailover) || !self.automaticFailover.enabled
+                || self.clusterType == ''EXTERNAL'''
+            - message: 'failoverMode Automatic on any replica requires clusterType:
+                EXTERNAL'
+              rule: '!self.replicas.exists(r, r.failoverMode == ''Automatic'') ||
+                self.clusterType == ''EXTERNAL'''
           status:
             description: SQLServerAvailabilityGroupStatus defines the observed state
               of the AG.

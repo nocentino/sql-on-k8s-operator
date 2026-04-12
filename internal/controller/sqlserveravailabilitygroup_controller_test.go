@@ -114,6 +114,9 @@ var _ = Describe("SQLServerAvailabilityGroup Controller", func() {
 					Key:                  "SA_PASSWORD",
 				},
 				EndpointPort: 5022,
+				// ClusterType must be EXTERNAL when any replica uses FailoverMode Automatic
+				// (CEL validation enforces this at admission time).
+				ClusterType: sqlv1alpha1.AGClusterTypeExternal,
 				Replicas: []sqlv1alpha1.AGReplicaSpec{
 					{Name: "primary", AvailabilityMode: sqlv1alpha1.SynchronousCommit, FailoverMode: sqlv1alpha1.FailoverModeAutomatic},
 					{Name: "secondary-1", AvailabilityMode: sqlv1alpha1.SynchronousCommit, FailoverMode: sqlv1alpha1.FailoverModeAutomatic},

@@ -161,9 +161,9 @@ func (r *SQLServerInstanceReconciler) reconcileServices(ctx context.Context, ins
 		return err
 	}
 
-	// ClusterIP service for client access
-	clusterSvc := &corev1.Service{}
-	err = r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, clusterSvc)
+	// Client-facing service — create if missing, update type if it has drifted.
+	clientSvc := &corev1.Service{}
+	err = r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, clientSvc)
 	if errors.IsNotFound(err) {
 		svc := r.buildClusterIPService(instance)
 		if err2 := controllerutil.SetControllerReference(instance, svc, r.Scheme); err2 != nil {
@@ -171,7 +171,20 @@ func (r *SQLServerInstanceReconciler) reconcileServices(ctx context.Context, ins
 		}
 		return r.Create(ctx, svc)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	desiredType := instance.Spec.ServiceType
+	if desiredType == "" {
+		desiredType = corev1.ServiceTypeClusterIP
+	}
+	if clientSvc.Spec.Type != desiredType {
+		clientSvc.Spec.Type = desiredType
+		if err2 := r.Update(ctx, clientSvc); err2 != nil {
+			return err2
+		}
+	}
+	return nil
 }
 
 // updateStatus refreshes the SQLServerInstance status subresource.

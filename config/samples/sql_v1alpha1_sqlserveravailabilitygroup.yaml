@@ -16,6 +16,14 @@ spec:
     name: mssql-ag-secret
     key: SA_PASSWORD
   endpointPort: 5022
+  # EXTERNAL designates the operator as the external cluster manager, enabling
+  # planned failover (ALTER AG FAILOVER) and automatic unplanned failover.
+  # Required when any replica has failoverMode: Automatic or automaticFailover is configured.
+  clusterType: EXTERNAL
+  automaticFailover:
+    enabled: true
+    failoverThresholdSeconds: 30
+    healthThreshold: system
   replicas:
     - name: primary
       availabilityMode: SynchronousCommit

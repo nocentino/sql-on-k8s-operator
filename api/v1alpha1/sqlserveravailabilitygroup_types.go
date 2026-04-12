@@ -47,9 +47,8 @@ const (
 	// AGClusterTypeNone is the original read-scale mode. All failover must be manual.
 	AGClusterTypeNone AGClusterType = "NONE"
 	// AGClusterTypeExternal designates the operator as the external cluster manager.
-	// It enables clean planned failover (ALTER AG FAILOVER) and allows the operator
-	// to issue FORCE_FAILOVER_ALLOW_DATA_LOSS for unplanned failover when the primary pod
-	// becomes unhealthy.
+	// It enables clean planned failover and automatic unplanned failover (ALTER AG FAILOVER)
+	// to synchronous replicas when the primary pod becomes unhealthy.
 	AGClusterTypeExternal AGClusterType = "EXTERNAL"
 )
 
@@ -127,6 +126,15 @@ type ListenerSpec struct {
 }
 
 // SQLServerAvailabilityGroupSpec defines the desired state of an Always On AG.
+//
+// Cross-field validation rules:
+//   - automaticFailover requires clusterType EXTERNAL (the operator can only issue
+//     ALTER AVAILABILITY GROUP FAILOVER when acting as the external cluster manager).
+//   - failoverMode Automatic on any replica requires clusterType EXTERNAL (SQL Server
+//     only honours Automatic failover mode when an external cluster manager is present).
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.automaticFailover) || !self.automaticFailover.enabled || self.clusterType == 'EXTERNAL'",message="automaticFailover requires clusterType: EXTERNAL"
+// +kubebuilder:validation:XValidation:rule="!self.replicas.exists(r, r.failoverMode == 'Automatic') || self.clusterType == 'EXTERNAL'",message="failoverMode Automatic on any replica requires clusterType: EXTERNAL"
 type SQLServerAvailabilityGroupSpec struct {
 	// AGName is the name of the SQL Server Availability Group (T-SQL).
 	// +kubebuilder:validation:Required
