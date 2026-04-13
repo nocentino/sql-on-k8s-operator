@@ -62,8 +62,14 @@ spec:
           metadata:
             type: object
           spec:
-            description: SQLServerAvailabilityGroupSpec defines the desired state
-              of an Always On AG.
+            description: |-
+              SQLServerAvailabilityGroupSpec defines the desired state of an Always On AG.
+
+              Cross-field validation rules:
+                - automaticFailover requires clusterType EXTERNAL (the operator can only issue
+                  ALTER AVAILABILITY GROUP FAILOVER when acting as the external cluster manager).
+                - failoverMode Automatic on any replica requires clusterType EXTERNAL (SQL Server
+                  only honours Automatic failover mode when an external cluster manager is present).
             properties:
               acceptEula:
                 default: "Y"
@@ -73,9 +79,12 @@ spec:
                 - "y"
                 type: string
               agName:
-                description: AGName is the name of the SQL Server Availability Group
-                  (T-SQL).
+                description: |-
+                  AGName is the name of the SQL Server Availability Group (T-SQL).
+                  Must start with a letter or underscore and contain only letters, digits, and underscores.
+                  This restriction prevents SQL injection via bracket-escaped identifiers in generated T-SQL.
                 maxLength: 128
+                pattern: ^[A-Za-z_][A-Za-z0-9_]*$
                 type: string
               automaticFailover:
                 description: |-
@@ -97,6 +106,28 @@ spec:
                     format: int32
                     minimum: 10
                     type: integer
+                  healthThreshold:
+                    default: system
+                    description: |-
+                      HealthThreshold controls how sensitive the automatic failover is to SQL Server
+                      internal health degradation detected by sp_server_diagnostics, independently of
+                      whether the pod itself is Kubernetes-Ready. Matches Microsoft's mssql-server-ha
+                      health level constants:
+
+                        system           — trigger only on OS/scheduler-level errors (default; equivalent
+                                           to Microsoft's ServerCriticalError threshold)
+                        resource         — also trigger on buffer-pool/memory-pressure errors
+                        query_processing — also trigger on worker-deadlock/long-running-query errors
+                                           (most sensitive; equivalent to ServerAnyQualifiedError)
+
+                      When the primary pod is K8s-Ready but sp_server_diagnostics reports a failure at
+                      or beyond this threshold, the operator treats the pod as degraded and starts the
+                      failover timer just as if the pod had become NotReady.
+                    enum:
+                    - system
+                    - resource
+                    - query_processing
+                    type: string
                 required:
                 - enabled
                 type: object
@@ -348,6 +379,19 @@ spec:
                       data and log files.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  reclaimPolicy:
+                    default: Retain
+                    description: |-
+                      ReclaimPolicy controls what happens to the underlying PersistentVolume when the
+                      PVC is deleted. The operator patches the bound PV's reclaimPolicy to match this
+                      field on every reconcile, overriding the StorageClass default.
+                        Retain  — PV is kept after the PVC is deleted; data is preserved for manual recovery.
+                        Delete  — PV and its backing storage are deleted together with the PVC.
+                      Defaults to Retain to protect SQL Server data from accidental loss.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
                   storageClassName:
                     description: StorageClassName is the name of the StorageClass
                       to use (e.g. standard, managed-csi).
@@ -400,6 +444,14 @@ spec:
             - saPasswordSecretRef
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: 'automaticFailover requires clusterType: EXTERNAL'
+              rule: '!has(self.automaticFailover) || !self.automaticFailover.enabled
+                || self.clusterType == ''EXTERNAL'''
+            - message: 'failoverMode Automatic on any replica requires clusterType:
+                EXTERNAL'
+              rule: '!self.replicas.exists(r, r.failoverMode == ''Automatic'') ||
+                self.clusterType == ''EXTERNAL'''
           status:
             description: SQLServerAvailabilityGroupStatus defines the observed state
               of the AG.
@@ -863,6 +915,18 @@ spec:
                 - key
                 type: object
                 x-kubernetes-map-type: atomic
+              serviceType:
+                default: ClusterIP
+                description: |-
+                  ServiceType controls how the client-facing Service is exposed.
+                  ClusterIP (default) exposes the instance inside the cluster only.
+                  NodePort exposes it on each node's IP at a static port.
+                  LoadBalancer provisions an external load balancer (cloud providers).
+                enum:
+                - ClusterIP
+                - NodePort
+                - LoadBalancer
+                type: string
               storage:
                 description: Storage defines the persistent volume configuration for
                   SQL Server data files.
@@ -883,6 +947,19 @@ spec:
                       data and log files.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  reclaimPolicy:
+                    default: Retain
+                    description: |-
+                      ReclaimPolicy controls what happens to the underlying PersistentVolume when the
+                      PVC is deleted. The operator patches the bound PV's reclaimPolicy to match this
+                      field on every reconcile, overriding the StorageClass default.
+                        Retain  — PV is kept after the PVC is deleted; data is preserved for manual recovery.
+                        Delete  — PV and its backing storage are deleted together with the PVC.
+                      Defaults to Retain to protect SQL Server data from accidental loss.
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
                   storageClassName:
                     description: StorageClassName is the name of the StorageClass
                       to use (e.g. standard, managed-csi).
@@ -1099,6 +1176,7 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - persistentvolumes
   - pods
   verbs:
   - get
