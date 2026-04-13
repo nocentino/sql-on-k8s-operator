@@ -481,9 +481,19 @@ func (r *SQLServerAvailabilityGroupReconciler) joinSecondaries(
 		if clusterType != agClusterTypeNone {
 			// Transition from RESOLVING → SECONDARY so SQL Server reports the replica
 			// as SECONDARY+CONNECTED and the operator's health monitoring can proceed.
-			if _, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
-				sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); err != nil {
-				log.Error(err, "Could not set secondary role on secondary", "pod", secondaryPod)
+			// The AG resource on the secondary may not be online immediately after JOIN,
+			// so retry a few times with a short delay (Msg 41104).
+			var setRoleErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				if _, setRoleErr = exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+					sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setRoleErr == nil {
+					break
+				}
+				log.Info("SET(ROLE=SECONDARY) not ready yet, retrying", "pod", secondaryPod, "attempt", attempt, "err", setRoleErr)
+				time.Sleep(time.Duration(attempt*5) * time.Second)
+			}
+			if setRoleErr != nil {
+				log.Error(setRoleErr, "Could not set secondary role on secondary", "pod", secondaryPod)
 				return ctrl.Result{RequeueAfter: 15 * time.Second}
 			}
 			log.Info("Set SECONDARY role on secondary", "pod", secondaryPod)
