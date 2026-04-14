@@ -187,9 +187,21 @@ const addTestDBtoAGSQL = `ALTER AVAILABILITY GROUP AG1 ADD DATABASE testdb;`
 // ready to join the AG. Run BEFORE addTestDBtoAGSQL on the primary.
 const restoreTestDBForHADR = `RESTORE DATABASE testdb FROM DISK = '/var/opt/mssql/data/testdb.bak' WITH NORECOVERY, REPLACE;`
 
-// joinDBOnSecondarySQL joins an already-restored testdb to the named AG.
+// joinDBOnSecondarySQL joins an already-restored testdb to the named AG,
+// guarded by an idempotency check so that re-running it does not produce
+// the noisy Error 41145 ("The database has already joined the AG").
 // Run AFTER addTestDBtoAGSQL on the primary.
-const joinDBOnSecondarySQL = `ALTER DATABASE testdb SET HADR AVAILABILITY GROUP = AG1;`
+const joinDBOnSecondarySQL = `
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.dm_hadr_database_replica_states drs
+    JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
+    JOIN sys.databases d ON drs.database_id = d.database_id
+    WHERE ag.name = 'AG1' AND d.name = 'testdb' AND drs.is_local = 1
+)
+BEGIN
+    ALTER DATABASE testdb SET HADR AVAILABILITY GROUP = AG1;
+END`
 
 // removeDBFromAGSQL removes testdb from the AG gracefully (run on primary).
 const removeDBFromAGSQL = `ALTER AVAILABILITY GROUP AG1 REMOVE DATABASE testdb;`

@@ -313,3 +313,55 @@ BEGIN
     ALTER AVAILABILITY GROUP [%s] GRANT CREATE ANY DATABASE;
 END`, agName, agName, clusterType, agName)
 }
+
+// AGDatabasesSQL returns a query that lists the names of databases in the AG
+// on the local replica (primary). Used to discover which databases need to be
+// joined on secondaries after the replica JOIN has completed.
+func AGDatabasesSQL(agName string) string {
+	return fmt.Sprintf(`SET NOCOUNT ON;
+SELECT d.name
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
+JOIN sys.databases d ON drs.database_id = d.database_id
+WHERE ag.name = '%s' AND drs.is_local = 1;`, agName)
+}
+
+// DatabaseInAGSQL returns a query that yields '1' if the named database is
+// already associated with the named AG on the local replica, or an empty
+// result set otherwise.
+//
+// The check uses sys.dm_hadr_database_replica_states joined to
+// sys.availability_groups and sys.databases so that both the AG name and the
+// database name can be matched. This works on both the primary and secondaries.
+func DatabaseInAGSQL(dbName, agName string) string {
+	return fmt.Sprintf(`SET NOCOUNT ON;
+SELECT 1
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
+JOIN sys.databases d ON drs.database_id = d.database_id
+WHERE ag.name = '%s' AND d.name = '%s' AND drs.is_local = 1;`,
+		escapeSQLString(agName), escapeSQLString(dbName))
+}
+
+// JoinDatabaseToAGSQL returns T-SQL that joins a specific database to the
+// named AG on a secondary replica, guarded by an idempotency check.
+//
+// If the database is already associated with the AG on the local replica
+// (as reported by sys.dm_hadr_database_replica_states), the command is
+// skipped — eliminating the harmless but noisy Error 41145 ("The database
+// has already joined the availability group").
+func JoinDatabaseToAGSQL(dbName, agName string) string {
+	escaped := escapeSQLString(dbName)
+	escapedAG := escapeSQLString(agName)
+	return fmt.Sprintf(`
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.dm_hadr_database_replica_states drs
+    JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
+    JOIN sys.databases d ON drs.database_id = d.database_id
+    WHERE ag.name = '%s' AND d.name = '%s' AND drs.is_local = 1
+)
+BEGIN
+    ALTER DATABASE [%s] SET HADR AVAILABILITY GROUP = [%s];
+END`, escapedAG, escaped, dbName, agName)
+}

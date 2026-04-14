@@ -183,9 +183,12 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 	// replica role is SECONDARY but their databases are stuck in NOT SYNCHRONIZING state.
 	// Re-issuing SET (ROLE = SECONDARY) forces them to re-establish the database
 	// mirroring session with the new primary.
+	var hadNotSynchronizing bool
 	if effectiveClusterType(ag.Spec.ClusterType) != agClusterTypeNone {
-		if err := r.reconcileNotSynchronizingReplicas(ctx, ag); err != nil {
-			log.Error(err, "Could not reconcile NOT SYNCHRONIZING replicas; will retry on next poll")
+		var nserr error
+		hadNotSynchronizing, nserr = r.reconcileNotSynchronizingReplicas(ctx, ag)
+		if nserr != nil {
+			log.Error(nserr, "Could not reconcile NOT SYNCHRONIZING replicas; will retry on next poll")
 		}
 	}
 
@@ -194,6 +197,11 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 		return ctrl.Result{}, fmt.Errorf("could not reconcile PV reclaim policy: %w", err)
 	}
 
+	// Requeue sooner when NOT SYNCHRONIZING replicas were found so the
+	// verify-retry loop converges faster than the normal 60s poll interval.
+	if hadNotSynchronizing {
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
 	// Requeue periodically to keep status fresh and detect failovers
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
@@ -502,6 +510,58 @@ func (r *SQLServerAvailabilityGroupReconciler) joinSecondaries(
 	return ctrl.Result{}
 }
 
+// joinDatabasesOnSecondaries queries the primary for databases in the AG and
+// explicitly joins each one on every secondary using the idempotent
+// JoinDatabaseToAGSQL command (which includes an IF NOT EXISTS guard).
+//
+// This ensures that databases added to the AG externally (e.g. via
+// ALTER AVAILABILITY GROUP ADD DATABASE) are properly joined on secondaries
+// without producing the noisy Error 41145 on re-runs.
+func (r *SQLServerAvailabilityGroupReconciler) joinDatabasesOnSecondaries(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	primaryPod, saPassword string,
+) {
+	log := logf.FromContext(ctx)
+
+	// Discover databases in the AG from the primary.
+	result, err := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword,
+		sqlutil.AGDatabasesSQL(ag.Spec.AGName))
+	if err != nil {
+		log.Info("Could not query AG databases from primary; skipping database join", "err", err)
+		return
+	}
+
+	agPrefix := ag.Name + "-"
+	var databases []string
+	for line := range strings.SplitSeq(result.Stdout, "\n") {
+		dbName := strings.TrimSpace(line)
+		// Filter out empty lines, column headers, and separator lines.
+		if dbName == "" || strings.HasPrefix(dbName, agPrefix) || strings.HasPrefix(dbName, "-") || dbName == "name" {
+			continue
+		}
+		databases = append(databases, dbName)
+	}
+	if len(databases) == 0 {
+		return
+	}
+
+	// For each secondary, join each database using the idempotent command.
+	for i := 1; i < len(ag.Spec.Replicas); i++ {
+		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
+		for _, dbName := range databases {
+			if _, joinErr := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+				sqlutil.JoinDatabaseToAGSQL(dbName, ag.Spec.AGName)); joinErr != nil {
+				log.Info("Could not join database on secondary (may not be restored yet)",
+					"database", dbName, "pod", secondaryPod, "err", joinErr)
+			} else {
+				log.Info("Ensured database joined on secondary", "database", dbName, "pod", secondaryPod)
+			}
+		}
+	}
+}
+
 // bootstrapAG orchestrates the T-SQL AG setup across all replica pods.
 // Steps:
 //  1. Wait until all pods are ready
@@ -676,6 +736,13 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	if result := r.joinSecondaries(ctx, ag, exec, saPassword, clusterType); result.RequeueAfter > 0 {
 		return result, nil
 	}
+
+	// Step 6b: Idempotent database join on each secondary.
+	// Query the primary for databases already in the AG, then explicitly join
+	// each one on every secondary using a guarded command. This eliminates
+	// the noisy Error 41145 ("The database has already joined the AG") that
+	// SQL Server logs when automatic seeding re-encounters an existing database.
+	r.joinDatabasesOnSecondaries(ctx, ag, exec, primaryPod, saPassword)
 
 	// Step 7: Wait for all secondaries to reach SECONDARY+CONNECTED before declaring
 	// bootstrap complete. If this times out the HADR transport failed to establish —
@@ -1302,38 +1369,85 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 // SECONDARY but their database synchronization_state_desc stays NOT SYNCHRONIZING.
 // Re-issuing SET (ROLE = SECONDARY) forces SQL Server to tear down and rebuild the
 // database mirroring session, which restores synchronization.
-func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
+func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (bool, error) {
 	log := logf.FromContext(ctx)
 	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
-		return nil
+		return false, nil
 	}
 	saPassword, err := r.getSAPassword(ctx, ag)
 	if err != nil {
-		return err
+		return false, err
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+
+	// Query the primary for NOT SYNCHRONIZING secondaries.
+	notSyncPods := r.queryNotSynchronizingPods(ctx, ag, exec, saPassword)
+	if len(notSyncPods) == 0 {
+		return false, nil
+	}
+
+	// Re-seat each NOT SYNCHRONIZING replica with a verify-retry loop.
+	// After issuing SET(ROLE=SECONDARY), wait briefly and re-check.
+	// Under heavy load the mirroring session may not stick on the first attempt.
+	const maxAttempts = 3
+	const verifyDelay = 10 * time.Second
+	for _, podName := range notSyncPods {
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)",
+				"pod", podName, "attempt", attempt)
+			if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+				sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
+				log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
+				break // SQL error — don't retry, let the next reconcile handle it
+			}
+			log.Info("Re-seated NOT SYNCHRONIZING replica", "pod", podName)
+			if attempt == maxAttempts {
+				break // no point verifying on the last attempt
+			}
+			time.Sleep(verifyDelay)
+			// Re-check if this specific pod is still NOT SYNCHRONIZING.
+			stillBad := r.queryNotSynchronizingPods(ctx, ag, exec, saPassword)
+			found := false
+			for _, p := range stillBad {
+				if p == podName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				log.Info("Re-seat verified: replica is now synchronizing", "pod", podName)
+				break
+			}
+			log.Info("Re-seat did not stick; retrying", "pod", podName, "attempt", attempt)
+		}
+	}
+	return true, nil
+}
+
+// queryNotSynchronizingPods returns the pod names of secondaries with databases
+// in NOT SYNCHRONIZING state, as seen from the primary.
+func (r *SQLServerAvailabilityGroupReconciler) queryNotSynchronizingPods(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	saPassword string,
+) []string {
 	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
 		sqlutil.NotSynchronizingReplicasSQL(ag.Spec.AGName))
 	if err != nil {
-		log.Info("Could not query NOT SYNCHRONIZING replicas from primary", "err", err)
+		logf.FromContext(ctx).Info("Could not query NOT SYNCHRONIZING replicas from primary", "err", err)
 		return nil
 	}
 	agPrefix := ag.Name + "-"
+	var pods []string
 	for line := range strings.SplitSeq(result.Stdout, "\n") {
 		replicaName := strings.TrimSpace(line)
 		if replicaName == "" || !strings.HasPrefix(replicaName, agPrefix) {
 			continue
 		}
-		podName := replicaName
-		log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)", "pod", podName)
-		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
-			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
-			log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
-		} else {
-			log.Info("Re-seated NOT SYNCHRONIZING replica", "pod", podName)
-		}
+		pods = append(pods, replicaName)
 	}
-	return nil
+	return pods
 }
 
 // failoverHeadlessAG handles the "headless AG" scenario: the recorded primary pod
