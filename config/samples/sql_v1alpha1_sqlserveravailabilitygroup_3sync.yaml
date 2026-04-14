@@ -32,7 +32,8 @@ spec:
       readableSecondary: true
   storage:
     dataVolumeSize: "20Gi"
-    reclaimPolicy: Retain
+    storageClassName: managed-csi-premium
+    reclaimPolicy: Delete
   mssqlConf:
     "sqlagent.enabled": "true"
   listener:

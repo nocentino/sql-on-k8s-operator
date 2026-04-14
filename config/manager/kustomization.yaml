@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: nocentino/sql-on-k8s-operator
-  newTag: "0.08"
+  newTag: "0.09"
