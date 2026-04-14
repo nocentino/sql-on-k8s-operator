@@ -28,20 +28,6 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
-./scripts/*
-ag-health-3sync.csv
-ag-health-unplanned.csv
-analyze-logs.sh
-failover-report-3sync.txt
-join-db.sh
-monitor-ag.sh
-run-3sync-failover-test.sh
-run-failover-test.sh
-run-unplanned-failover-test.sh
-unplanned-failover-report.txt
-wait-synchronized.sh
-scripts/check-seeding.sh
-scripts/collect-logs.sh
-scripts/setup-db.sh
-scripts/test-a-planned.sh
-scripts/test-b-unplanned.sh
+
+# Failover testing scripts, logs, and generated artifacts
+mytesting/*
