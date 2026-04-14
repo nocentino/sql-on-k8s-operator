@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1369,6 +1370,13 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 // SECONDARY but their database synchronization_state_desc stays NOT SYNCHRONIZING.
 // Re-issuing SET (ROLE = SECONDARY) forces SQL Server to tear down and rebuild the
 // database mirroring session, which restores synchronization.
+//
+// IMPORTANT: SET (ROLE = SECONDARY) must NOT be issued while automatic seeding is in
+// progress for a database on that secondary. SQL Server cancels in-flight seeding
+// (internal reason code 215) when the replica role is reset, creating an infinite
+// cancel-and-restart loop. Before re-seating, the number of online user databases on
+// the secondary is compared to the count of databases in the AG on the primary: if
+// the secondary has fewer databases, seeding is still running and the re-seat is skipped.
 func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (bool, error) {
 	log := logf.FromContext(ctx)
 	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
@@ -1386,12 +1394,26 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		return false, nil
 	}
 
+	// Fetch the count of databases in the AG from the primary once, so we can
+	// compare against each secondary's online user-database count below.
+	agDBCount := r.queryAGDatabaseCount(ctx, ag, exec, saPassword)
+
 	// Re-seat each NOT SYNCHRONIZING replica with a verify-retry loop.
 	// After issuing SET(ROLE=SECONDARY), wait briefly and re-check.
 	// Under heavy load the mirroring session may not stick on the first attempt.
 	const maxAttempts = 3
 	const verifyDelay = 10 * time.Second
+	hadAny := false
 	for _, podName := range notSyncPods {
+		// Guard: skip re-seat if automatic seeding is in progress on this replica.
+		// Issuing SET(ROLE=SECONDARY) cancels any in-flight seeding operation
+		// (SQL Server internal reason 215), creating an infinite cancel-restart loop.
+		if agDBCount > 0 && r.isSeedingInProgress(ctx, ag, exec, saPassword, podName, agDBCount) {
+			log.Info("Automatic seeding in progress; skipping re-seat to avoid cancelling seeding",
+				"pod", podName)
+			continue
+		}
+		hadAny = true
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
 			log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)",
 				"pod", podName, "attempt", attempt)
@@ -1421,7 +1443,57 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 			log.Info("Re-seat did not stick; retrying", "pod", podName, "attempt", attempt)
 		}
 	}
-	return true, nil
+	return hadAny, nil
+}
+
+// queryAGDatabaseCount returns the number of databases in the AG as seen from the primary.
+// Returns 0 if the query fails (treated as unknown — seeding check is skipped).
+func (r *SQLServerAvailabilityGroupReconciler) queryAGDatabaseCount(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	saPassword string,
+) int {
+	res, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+		sqlutil.AGDatabaseCountSQL(ag.Spec.AGName))
+	if err != nil {
+		return 0
+	}
+	n, parseErr := strconv.Atoi(strings.TrimSpace(res.Stdout))
+	if parseErr != nil {
+		return 0
+	}
+	return n
+}
+
+// isSeedingInProgress returns true when the secondary pod has fewer online user
+// databases than the AG has on the primary, indicating that automatic seeding
+// has not yet completed for at least one database.
+//
+// Automatic seeding creates the database on the secondary only after all pages
+// have been transferred. While seeding is in progress, sys.databases on the
+// secondary does not contain the database being seeded, so its online user-database
+// count will be less than the AG's database count on the primary.
+func (r *SQLServerAvailabilityGroupReconciler) isSeedingInProgress(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	saPassword string,
+	secondaryPod string,
+	agDatabaseCount int,
+) bool {
+	res, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+		sqlutil.UserDatabaseCountSQL())
+	if err != nil {
+		// Cannot connect to secondary; assume seeding is not in progress so
+		// the normal re-seat logic can handle a genuinely stuck replica.
+		return false
+	}
+	secCount, parseErr := strconv.Atoi(strings.TrimSpace(res.Stdout))
+	if parseErr != nil {
+		return false
+	}
+	return secCount < agDatabaseCount
 }
 
 // queryNotSynchronizingPods returns the pod names of secondaries with databases
