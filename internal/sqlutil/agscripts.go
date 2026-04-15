@@ -75,19 +75,6 @@ ADD REPLICA ON N'%s' WITH (
 );`, agName, replica.PodName, replica.EndpointFQDN, endpointPort, failoverMode, availMode, secondaryRole)
 }
 
-// DropAGLocalSQL returns T-SQL to drop the AG on the local replica.
-// After DROP, the AG metadata is removed from the local instance; a subsequent
-// pod restart + JOIN is needed to re-bootstrap the replica.
-func DropAGLocalSQL(agName string) string {
-	return fmt.Sprintf("IF EXISTS (SELECT 1 FROM sys.availability_groups WHERE name = '%s') DROP AVAILABILITY GROUP [%s];", agName, agName)
-}
-
-// DropDatabaseLocalSQL returns T-SQL to drop a database on the local replica.
-func DropDatabaseLocalSQL(dbName string) string {
-	return fmt.Sprintf("IF EXISTS (SELECT 1 FROM sys.databases WHERE name = '%s') DROP DATABASE [%s];",
-		escapeSQLString(dbName), dbName)
-}
-
 // SetAGOfflineSQL returns the T-SQL to offline the AG on the local replica.
 //
 // With CLUSTER_TYPE = EXTERNAL, a former primary that restarts may still report
@@ -145,7 +132,7 @@ DECLARE @ep NVARCHAR(128) = (
 IF @ep IS NOT NULL
 BEGIN
     EXEC(N'ALTER ENDPOINT [' + @ep + N'] STATE = STOPPED');
-    WAITFOR DELAY '00:00:05';
+    WAITFOR DELAY '00:00:03';
     EXEC(N'ALTER ENDPOINT [' + @ep + N'] STATE = STARTED');
 END`
 }
@@ -185,29 +172,6 @@ WHERE ag.name = '%s'
   AND rs.is_local = 0
   AND rs.role_desc = 'SECONDARY'
   AND drs.synchronization_state_desc = 'NOT SYNCHRONIZING';`, agName)
-}
-
-// SyncReplicaStatesSQL returns a query that yields one row per non-local replica with:
-//   - replica_name  : the short pod hostname (@@SERVERNAME on that pod)
-//   - avail_mode    : SYNCHRONOUS_COMMIT or ASYNCHRONOUS_COMMIT
-//   - sync_state    : SYNCHRONIZED, SYNCHRONIZING, NOT_SYNCHRONIZING, etc.
-//   - role          : PRIMARY or SECONDARY (from the local replica's perspective)
-//
-// Used by the controller to select the best automatic failover target.
-func SyncReplicaStatesSQL(agName string) string {
-	return fmt.Sprintf(`SET NOCOUNT ON;
-SELECT
-    ar.replica_server_name AS replica_name,
-    ar.availability_mode_desc  AS avail_mode,
-    drs.synchronization_state_desc AS sync_state,
-    rs.role_desc AS role
-FROM sys.availability_groups ag
-JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
-JOIN sys.dm_hadr_availability_replica_states rs ON ar.replica_id = rs.replica_id
-LEFT JOIN sys.dm_hadr_database_replica_states drs
-    ON rs.replica_id = drs.replica_id AND drs.is_local = 0
-WHERE ag.name = '%s'
-  AND rs.is_local = 0;`, agName)
 }
 
 // escapeSQLString escapes single quotes for use inside T-SQL string literals.
@@ -280,19 +244,6 @@ END`, endpointName, endpointName, port, certName)
 // GrantEndpointConnectSQL grants CONNECT on the endpoint to a login.
 func GrantEndpointConnectSQL(endpointName, loginName string) string {
 	return fmt.Sprintf(`GRANT CONNECT ON ENDPOINT::%s TO %s;`, endpointName, loginName)
-}
-
-// EnableHADRSQL returns the mssql.conf hadr enable snippet (applied via ConfigMap, not T-SQL).
-// The actual T-SQL to enable HADR is executed after instance restart.
-func EnableHADRSQL() string {
-	return `
-IF (SELECT value_in_use FROM sys.configurations WHERE name = 'hadr enabled') = 0
-BEGIN
-    EXEC sp_configure 'show advanced options', 1;
-    RECONFIGURE;
-    EXEC sp_configure 'hadr enabled', 1;
-    RECONFIGURE;
-END`
 }
 
 // AGReplicaInput carries the fields needed to build CREATE AVAILABILITY GROUP replica specs.
@@ -450,22 +401,6 @@ WHERE ag.name = '%s' AND drs.is_local = 1;`, agName)
 }
 
 // DatabaseInAGSQL returns a query that yields '1' if the named database is
-// already associated with the named AG on the local replica, or an empty
-// result set otherwise.
-//
-// The check uses sys.dm_hadr_database_replica_states joined to
-// sys.availability_groups and sys.databases so that both the AG name and the
-// database name can be matched. This works on both the primary and secondaries.
-func DatabaseInAGSQL(dbName, agName string) string {
-	return fmt.Sprintf(`SET NOCOUNT ON;
-SELECT 1
-FROM sys.dm_hadr_database_replica_states drs
-JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
-JOIN sys.databases d ON drs.database_id = d.database_id
-WHERE ag.name = '%s' AND d.name = '%s' AND drs.is_local = 1;`,
-		escapeSQLString(agName), escapeSQLString(dbName))
-}
-
 // JoinDatabaseToAGSQL returns T-SQL that joins a specific database to the
 // named AG on a secondary replica, guarded by an idempotency check.
 //

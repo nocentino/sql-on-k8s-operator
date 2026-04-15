@@ -217,7 +217,7 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 	// 15s gives the endpoint restart logic visibility into recovery progress and catches
 	// successful autonomous transitions (RESOLVING→SECONDARY) quickly without hammering SQL.
 	if hadResolving || hadNotSynchronizing {
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	// Requeue periodically to keep status fresh and detect failovers
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
@@ -1166,33 +1166,6 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 								{Name: "mssql-data", MountPath: "/var/opt/mssql"},
 								{Name: "mssql-conf", MountPath: "/var/opt/mssql/mssql.conf", SubPath: "mssql.conf"},
 							},
-							Lifecycle: &corev1.Lifecycle{
-								PostStart: &corev1.LifecycleHandler{
-									Exec: &corev1.ExecAction{
-										Command: []string{"/bin/bash", "-c", `
-for i in $(seq 1 30); do
-  /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -b -Q "SELECT 1" >/dev/null 2>&1 && break
-  sleep 1
-done
-HAS_AG=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -W -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.availability_groups" 2>/dev/null | head -1 | tr -d ' \r\n')
-if [ "$HAS_AG" = "0" ] || [ -z "$HAS_AG" ]; then exit 0; fi
-AG=""
-for i in $(seq 1 10); do
-  AG=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -W -h -1 -Q "SET NOCOUNT ON; SELECT TOP 1 ag.name FROM sys.availability_groups ag JOIN sys.dm_hadr_availability_replica_states ars ON ag.group_id = ars.group_id WHERE ars.is_local = 1 AND ars.role_desc = 'RESOLVING'" 2>/dev/null | head -1 | tr -d ' \r\n')
-  [ -n "$AG" ] && [ "$AG" != "(0rowsaffected)" ] && break
-  AG=""
-  sleep 1
-done
-if [ -n "$AG" ]; then
-  for a in $(seq 1 5); do
-    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -Q "ALTER AVAILABILITY GROUP [$AG] SET (ROLE = SECONDARY)" 2>&1 | grep -q 41104 || break
-    sleep 5
-  done
-fi
-exit 0`},
-									},
-								},
-							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
@@ -1439,6 +1412,25 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		return false, nil
 	}
 
+	// Clean up stale /notSyncStuck tracking keys for pods that recovered.
+	notSyncSet := make(map[string]struct{}, len(notSyncPods))
+	for _, p := range notSyncPods {
+		notSyncSet[p] = struct{}{}
+	}
+	prefix := ag.Namespace + "/" + ag.Name + "/"
+	r.reseatFirstFailureTime.Range(func(key, _ any) bool {
+		s, ok := key.(string)
+		if !ok || !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, "/notSyncStuck") {
+			return true
+		}
+		pod := strings.TrimPrefix(s, prefix)
+		pod = strings.TrimSuffix(pod, "/notSyncStuck")
+		if _, still := notSyncSet[pod]; !still {
+			r.reseatFirstFailureTime.Delete(key)
+		}
+		return true
+	})
+
 	agDBCount := r.queryAGDatabaseCount(ctx, ag, exec, saPassword)
 
 	for _, podName := range notSyncPods {
@@ -1470,14 +1462,14 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 			firstRaw, _ := r.reseatFirstFailureTime.LoadOrStore(stuckKey, now)
 			firstTime := firstRaw.(time.Time)
 			stuckDur := now.Sub(firstTime)
-			if stuckDur >= 30*time.Second {
+			if stuckDur >= 15*time.Second {
 				log.Info("Secondary persistently NOT SYNCHRONIZING despite successful re-seats; restarting HADR endpoint",
 					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
 				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
 					sqlutil.RestartHADREndpointSQL()); epErr != nil {
 					log.Error(epErr, "Could not restart HADR endpoint on stuck secondary", "pod", podName)
 				}
-				// Reset the timer so we don't spam restarts — next attempt after another 30s
+				// Reset the timer so we don't spam restarts — next attempt after another 15s
 				r.reseatFirstFailureTime.Store(stuckKey, now)
 			}
 		}
@@ -1546,7 +1538,7 @@ func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 		canRetry = now.Sub(lastTime) >= 90*time.Second
 	}
 
-	if (!offlineDone || canRetry) && stuckDuration >= 30*time.Second {
+	if (!offlineDone || canRetry) && stuckDuration >= 15*time.Second {
 		r.reseatFirstFailureTime.Store(offlineKey, now)
 		log.Info("Msg 41104; pod in RESOLVING — issuing ALTER AG OFFLINE + bilateral endpoint restart",
 			"pod", podName, "stuckFor", stuckDuration.Round(time.Second), "retry", canRetry)
@@ -1887,7 +1879,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 	// Primary is NotReady (or missing).
 	threshold := time.Duration(af.FailoverThresholdSeconds) * time.Second
 	if threshold < 10*time.Second {
-		threshold = 30 * time.Second
+		threshold = 10 * time.Second
 	}
 	now := metav1.Now()
 
