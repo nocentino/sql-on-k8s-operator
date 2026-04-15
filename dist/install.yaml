@@ -1177,8 +1177,17 @@ rules:
   - ""
   resources:
   - persistentvolumes
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
+  - delete
   - get
   - list
   - patch
@@ -1504,7 +1513,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: nocentino/sql-on-k8s-operator:0.10
+        image: nocentino/sql-on-k8s-operator:0.27
         imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:

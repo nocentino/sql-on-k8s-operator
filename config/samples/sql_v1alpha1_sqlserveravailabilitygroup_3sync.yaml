@@ -6,7 +6,7 @@ metadata:
   namespace: default
 spec:
   agName: "AG1"
-  image: mcr.microsoft.com/mssql/server:2025-latest
+  image: mcr.microsoft.com/mssql/server:2022-latest
   edition: Developer
   acceptEula: "Y"
   saPasswordSecretRef:

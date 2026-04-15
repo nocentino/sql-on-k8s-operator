@@ -31,3 +31,4 @@ go.work
 
 # Failover testing scripts, logs, and generated artifacts
 mytesting/*
+tasks/*

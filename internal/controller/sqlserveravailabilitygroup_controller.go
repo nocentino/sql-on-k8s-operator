@@ -23,8 +23,10 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -55,6 +57,13 @@ type SQLServerAvailabilityGroupReconciler struct {
 	Scheme     *runtime.Scheme
 	KubeClient kubernetes.Interface
 	RestConfig *rest.Config
+
+	// reseatFirstFailureTime records when the first consecutive 41104 failure was
+	// observed for each pod. Key: "namespace/agname/podname".
+	// When Msg 41104 is seen the operator simply retries SET(ROLE=SECONDARY)
+	// on each reconcile until SQL Server's internal AG resource manager clears
+	// the previous error autonomously. Cleared on success.
+	reseatFirstFailureTime sync.Map
 }
 
 // effectiveClusterType returns the string value of the cluster type, defaulting to NONE
@@ -89,7 +98,7 @@ const (
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch;patch
@@ -171,10 +180,15 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 	// After an unplanned failover the killed primary pod restarts and reconnects to
 	// the AG but lands in RESOLVING state. Without an explicit SET (ROLE = SECONDARY)
 	// it stays there indefinitely. reconcileResolvingReplicas detects such replicas
-	// on the primary and transitions each one to SECONDARY.
+	// on the primary and transitions each one to SECONDARY. When Msg 41104 prevents
+	// the transition, the reconcile loop simply retries until SQL Server's internal
+	// AG resource manager clears the previous error autonomously.
+	var hadResolving bool
 	if effectiveClusterType(ag.Spec.ClusterType) != agClusterTypeNone {
-		if err := r.reconcileResolvingReplicas(ctx, ag); err != nil {
-			log.Error(err, "Could not reconcile RESOLVING replicas; will retry on next poll")
+		var rserr error
+		hadResolving, rserr = r.reconcileResolvingReplicas(ctx, ag)
+		if rserr != nil {
+			log.Error(rserr, "Could not reconcile RESOLVING replicas; will retry on next poll")
 		}
 	}
 
@@ -198,9 +212,11 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 		return ctrl.Result{}, fmt.Errorf("could not reconcile PV reclaim policy: %w", err)
 	}
 
-	// Requeue sooner when NOT SYNCHRONIZING replicas were found so the
+	// Requeue sooner when RESOLVING or NOT SYNCHRONIZING replicas are active so the
 	// verify-retry loop converges faster than the normal 60s poll interval.
-	if hadNotSynchronizing {
+	// 15s gives the endpoint restart logic visibility into recovery progress and catches
+	// successful autonomous transitions (RESOLVING→SECONDARY) quickly without hammering SQL.
+	if hadResolving || hadNotSynchronizing {
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 	// Requeue periodically to keep status fresh and detect failovers
@@ -1314,70 +1330,61 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 //
 // This handles the pod-restart case: after an unplanned failover, the killed primary pod
 // restarts and reconnects to the AG but remains in RESOLVING state indefinitely — SQL Server
-// requires the external cluster manager to explicitly grant it the SECONDARY role. This is
-// analogous to Pacemaker's "start" action in the mssql-server-ha OCF agent.
+// requires the external cluster manager to explicitly grant it the SECONDARY role.
 //
-// The function queries the current primary for non-local replicas in RESOLVING state and
-// issues the transition command directly on each affected pod's SQL connection.
-func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
+// When SET(ROLE=SECONDARY) fails with Msg 41104 ("previous error"), the operator simply
+// retries on the next reconcile. SQL Server's internal AG resource manager will clear
+// the previous error autonomously — matching the PDS agmonitor approach.
+func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (hadAny bool, err error) {
 	log := logf.FromContext(ctx)
 	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
-		return nil
+		return false, nil
 	}
 	saPassword, err := r.getSAPassword(ctx, ag)
 	if err != nil {
-		return err
+		return false, err
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
 		sqlutil.ResolvingReplicasSQL(ag.Spec.AGName))
 	if err != nil {
-		// Primary may be mid-failover; log and return nil to avoid blocking the reconcile loop.
 		log.Info("Could not query RESOLVING replicas from primary", "err", err)
-		return nil
+		return false, nil
 	}
-	// Filter output lines to valid pod names.
-	// sqlcmd output (without -h -1) includes a column-header line (e.g.
-	// "replica_server_name") and a separator line ("----------...") before the
-	// data rows.  Pod names in this operator are always prefixed with the AG
-	// name followed by a hyphen (e.g. "mssql-ag-0"), so any other line is noise.
+
 	agPrefix := ag.Name + "-"
 	for line := range strings.SplitSeq(result.Stdout, "\n") {
 		replicaName := strings.TrimSpace(line)
 		if replicaName == "" || !strings.HasPrefix(replicaName, agPrefix) {
-			continue // skip blank lines, column headers, and separator lines
+			continue
 		}
-		// replica_server_name matches the pod name (@@SERVERNAME = short pod hostname).
 		podName := replicaName
+		hadAny = true
+
 		log.Info("Detected RESOLVING secondary; transitioning to SECONDARY", "pod", podName)
+
 		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
-			log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
+			if strings.Contains(setErr.Error(), "41104") {
+				r.handle41104(ctx, ag, exec, saPassword, podName, log)
+			} else {
+				log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
+			}
 		} else {
+			r.clear41104Tracking(ag, podName)
 			log.Info("Set SECONDARY role on RESOLVING replica", "pod", podName)
 		}
 	}
-	return nil
+	return hadAny, nil
 }
 
 // reconcileNotSynchronizingReplicas detects SECONDARY replicas whose databases are stuck
 // in NOT SYNCHRONIZING state (CLUSTER_TYPE = EXTERNAL) and re-seats them by issuing
 // ALTER AVAILABILITY GROUP SET (ROLE = SECONDARY).
 //
-// This handles a common post-failover scenario: after either planned or unplanned failover,
-// secondaries that were syncing with the old primary sometimes do not automatically
-// re-establish database synchronization with the new primary. Their replica role shows
-// SECONDARY but their database synchronization_state_desc stays NOT SYNCHRONIZING.
-// Re-issuing SET (ROLE = SECONDARY) forces SQL Server to tear down and rebuild the
-// database mirroring session, which restores synchronization.
-//
-// IMPORTANT: SET (ROLE = SECONDARY) must NOT be issued while automatic seeding is in
-// progress for a database on that secondary. SQL Server cancels in-flight seeding
-// (internal reason code 215) when the replica role is reset, creating an infinite
-// cancel-and-restart loop. Before re-seating, the number of online user databases on
-// the secondary is compared to the count of databases in the AG on the primary: if
-// the secondary has fewer databases, seeding is still running and the re-seat is skipped.
-func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (bool, error) {
+// When SET(ROLE=SECONDARY) fails with Msg 41104, the operator simply retries on the
+// next reconcile — same pattern as reconcileResolvingReplicas.
+func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (hadAny bool, err error) {
 	log := logf.FromContext(ctx)
 	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
 		return false, nil
@@ -1388,62 +1395,100 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 
-	// Query the primary for NOT SYNCHRONIZING secondaries.
+	actualRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword, ag.Spec.AGName)
+	if roleErr != nil {
+		log.Info("Could not verify primary role; skipping NOT SYNCHRONIZING check", "pod", ag.Status.PrimaryReplica, "err", roleErr)
+		return false, nil
+	}
+	if actualRole != agRolePrimary {
+		log.Info("Recorded primary is not in PRIMARY role; skipping NOT SYNCHRONIZING re-seat",
+			"pod", ag.Status.PrimaryReplica, "role", actualRole)
+		return false, nil
+	}
+
 	notSyncPods := r.queryNotSynchronizingPods(ctx, ag, exec, saPassword)
 	if len(notSyncPods) == 0 {
 		return false, nil
 	}
 
-	// Fetch the count of databases in the AG from the primary once, so we can
-	// compare against each secondary's online user-database count below.
 	agDBCount := r.queryAGDatabaseCount(ctx, ag, exec, saPassword)
 
-	// Re-seat each NOT SYNCHRONIZING replica with a verify-retry loop.
-	// After issuing SET(ROLE=SECONDARY), wait briefly and re-check.
-	// Under heavy load the mirroring session may not stick on the first attempt.
-	const maxAttempts = 3
-	const verifyDelay = 10 * time.Second
-	hadAny := false
 	for _, podName := range notSyncPods {
-		// Guard: skip re-seat if automatic seeding is in progress on this replica.
-		// Issuing SET(ROLE=SECONDARY) cancels any in-flight seeding operation
-		// (SQL Server internal reason 215), creating an infinite cancel-restart loop.
 		if agDBCount > 0 && r.isSeedingInProgress(ctx, ag, exec, saPassword, podName, agDBCount) {
-			log.Info("Automatic seeding in progress; skipping re-seat to avoid cancelling seeding",
-				"pod", podName)
+			log.Info("Automatic seeding in progress; skipping re-seat", "pod", podName)
 			continue
 		}
+
 		hadAny = true
-		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)",
-				"pod", podName, "attempt", attempt)
-			if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
-				sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
+		log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)", "pod", podName)
+
+		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
+			if strings.Contains(setErr.Error(), "41104") {
+				r.handle41104(ctx, ag, exec, saPassword, podName, log)
+			} else {
 				log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
-				break // SQL error — don't retry, let the next reconcile handle it
 			}
+		} else {
+			r.clear41104Tracking(ag, podName)
 			log.Info("Re-seated NOT SYNCHRONIZING replica", "pod", podName)
-			if attempt == maxAttempts {
-				break // no point verifying on the last attempt
-			}
-			time.Sleep(verifyDelay)
-			// Re-check if this specific pod is still NOT SYNCHRONIZING.
-			stillBad := r.queryNotSynchronizingPods(ctx, ag, exec, saPassword)
-			found := false
-			for _, p := range stillBad {
-				if p == podName {
-					found = true
-					break
-				}
-			}
-			if !found {
-				log.Info("Re-seat verified: replica is now synchronizing", "pod", podName)
-				break
-			}
-			log.Info("Re-seat did not stick; retrying", "pod", podName, "attempt", attempt)
 		}
 	}
 	return hadAny, nil
+}
+
+// handle41104 manages Msg 41104 failures ("The Availability Group resource manager
+// is waiting for a previous error to be resolved").
+//
+// Recovery strategy:
+//  1. Check the pod's local AG role.
+//  2. If it still reports PRIMARY (split-brain after planned failover), issue
+//     ALTER AVAILABILITY GROUP … OFFLINE to reset the AG resource state from
+//     PRIMARY → RESOLVING. This is the equivalent of Pacemaker's offlineAndWait().
+//  3. On the next reconcile, retry SET(ROLE=SECONDARY). The AG resource manager
+//     clears the "previous error" once the OFFLINE has reset the state machine.
+//
+// No endpoint restarts, no DROP/JOIN, no REMOVE/ADD — those risk triggering a
+// full re-seed if a log backup truncates the chain.
+func (r *SQLServerAvailabilityGroupReconciler) handle41104(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	saPassword, podName string,
+	log logr.Logger,
+) {
+	cooldownKey := ag.Namespace + "/" + ag.Name + "/" + podName
+
+	now := time.Now()
+	firstRaw, _ := r.reseatFirstFailureTime.LoadOrStore(cooldownKey, now)
+	firstTime := firstRaw.(time.Time)
+	stuckDuration := now.Sub(firstTime)
+
+	// Check local role: after a planned failover the old primary may still report
+	// PRIMARY locally even though the actual primary has changed.  Running OFFLINE
+	// resets the AG resource from PRIMARY → RESOLVING, allowing a subsequent
+	// SET(ROLE=SECONDARY) to succeed.
+	localRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
+	if roleErr == nil && localRole == agRolePrimary {
+		log.Info("Msg 41104; pod still reports PRIMARY locally — issuing ALTER AG OFFLINE to reset state",
+			"pod", podName, "stuckFor", stuckDuration.Round(time.Second))
+		if _, offErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+			sqlutil.SetAGOfflineSQL(ag.Spec.AGName)); offErr != nil {
+			log.Error(offErr, "Could not take AG OFFLINE on stuck primary", "pod", podName)
+		}
+		return
+	}
+
+	log.Info("Msg 41104; waiting for AG resource manager to clear previous error",
+		"pod", podName, "stuckFor", stuckDuration.Round(time.Second))
+}
+
+// clear41104Tracking clears the 41104 failure tracking for a pod (called on success).
+func (r *SQLServerAvailabilityGroupReconciler) clear41104Tracking(
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup, podName string,
+) {
+	cooldownKey := ag.Namespace + "/" + ag.Name + "/" + podName
+	r.reseatFirstFailureTime.Delete(cooldownKey)
 }
 
 // queryAGDatabaseCount returns the number of databases in the AG as seen from the primary.

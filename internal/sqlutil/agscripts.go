@@ -46,14 +46,107 @@ func FailoverSQL(agName string) string {
 		agName)
 }
 
+// RemoveReplicaSQL returns T-SQL to remove a replica from the AG (run on the primary).
+func RemoveReplicaSQL(agName, replicaName string) string {
+	return fmt.Sprintf("ALTER AVAILABILITY GROUP [%s] REMOVE REPLICA ON N'%s';", agName, replicaName)
+}
+
+// AddReplicaSQL returns T-SQL to add a replica back to the AG (run on the primary).
+func AddReplicaSQL(agName string, replica AGReplicaInput, endpointPort int32, clusterType string) string {
+	availMode := "SYNCHRONOUS_COMMIT"
+	if replica.AvailabilityMode == "AsynchronousCommit" {
+		availMode = "ASYNCHRONOUS_COMMIT"
+	}
+	failoverMode := "MANUAL"
+	if clusterType != clusterTypeNone {
+		failoverMode = "EXTERNAL"
+	}
+	secondaryRole := "SECONDARY_ROLE (ALLOW_CONNECTIONS = NO)"
+	if replica.ReadableSecondary {
+		secondaryRole = "SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)"
+	}
+	return fmt.Sprintf(`ALTER AVAILABILITY GROUP [%s]
+ADD REPLICA ON N'%s' WITH (
+    ENDPOINT_URL = N'TCP://%s:%d',
+    FAILOVER_MODE = %s,
+    AVAILABILITY_MODE = %s,
+    SEEDING_MODE = AUTOMATIC,
+    %s
+);`, agName, replica.PodName, replica.EndpointFQDN, endpointPort, failoverMode, availMode, secondaryRole)
+}
+
+// DropAGLocalSQL returns T-SQL to drop the AG on the local replica.
+// After DROP, the AG metadata is removed from the local instance; a subsequent
+// pod restart + JOIN is needed to re-bootstrap the replica.
+func DropAGLocalSQL(agName string) string {
+	return fmt.Sprintf("IF EXISTS (SELECT 1 FROM sys.availability_groups WHERE name = '%s') DROP AVAILABILITY GROUP [%s];", agName, agName)
+}
+
+// DropDatabaseLocalSQL returns T-SQL to drop a database on the local replica.
+func DropDatabaseLocalSQL(dbName string) string {
+	return fmt.Sprintf("IF EXISTS (SELECT 1 FROM sys.databases WHERE name = '%s') DROP DATABASE [%s];",
+		escapeSQLString(dbName), dbName)
+}
+
+// SetAGOfflineSQL returns the T-SQL to offline the AG on the local replica.
+//
+// With CLUSTER_TYPE = EXTERNAL, a former primary that restarts may still report
+// role = PRIMARY even though another replica has been promoted. The internal AG
+// resource state machine holds a "previous error" flag (Msg 41104) that blocks
+// SET(ROLE=SECONDARY). Issuing ALTER AVAILABILITY GROUP … OFFLINE forces the AG
+// from PRIMARY → RESOLVING, clearing that stuck state. A subsequent
+// SET(ROLE=SECONDARY) can then transition cleanly from RESOLVING → SECONDARY.
+//
+// This is the equivalent of Pacemaker's offlineAndWait() in the mssql-server-ha
+// OCF agent, which runs ALTER AG OFFLINE on a replica that is PRIMARY but is
+// not the current master.
+func SetAGOfflineSQL(agName string) string {
+	return fmt.Sprintf("ALTER AVAILABILITY GROUP [%s] OFFLINE;", agName)
+}
+
 // SetRoleToSecondarySQL returns the T-SQL to transition a replica from RESOLVING to SECONDARY role.
 //
 // When CLUSTER_TYPE = EXTERNAL, secondaries land in RESOLVING state after JOIN and stay there
 // until an explicit SET (ROLE = SECONDARY) is issued. This is analogous to Pacemaker's "start"
 // action in the mssql-server-ha agent. Without this step, waitForSecondariesReady times out
 // because the replica never reports role_desc = 'SECONDARY'.
+//
+// If the replica is stuck with Msg 41104 ("previous error"), issue SetAGOfflineSQL first to
+// reset the AG resource state from PRIMARY → RESOLVING, then call this.
 func SetRoleToSecondarySQL(agName string) string {
 	return fmt.Sprintf("ALTER AVAILABILITY GROUP [%s] SET (ROLE = SECONDARY);", agName)
+}
+
+// RestartHADREndpointSQL stops and restarts the database mirroring endpoint used
+// by the Availability Group, forcing SQL Server to drop all existing transport
+// connections and make fresh connection attempts to other replicas.
+//
+// This clears the "previous error" state that causes Msg 41104 to persist for
+// ~14 minutes after a former primary restarts while a newly-promoted primary is
+// still initializing. The sequence is:
+//  1. Former primary restarts after kill; new primary is only ~8s old.
+//  2. Former primary attempts to connect to new primary → connection times out.
+//  3. SQL Server marks the AG resource as failed ("previous error").
+//  4. All subsequent SET(ROLE=SECONDARY) commands are rejected with Msg 41104.
+//  5. Restarting the endpoint forces a new connection attempt.
+//  6. The new primary has now been stable for ~30s → connection succeeds.
+//  7. AG resource comes online autonomously (RESOLVING_NORMAL → SECONDARY_NORMAL).
+//
+// Safe to call when the replica is in RESOLVING/NOT SYNCHRONIZING state; no data
+// is lost and the endpoint restarts in under one second.
+//
+// The endpoint name is discovered dynamically from sys.endpoints so the function
+// works regardless of how the endpoint was named during AG initialization.
+func RestartHADREndpointSQL() string {
+	return `
+DECLARE @ep NVARCHAR(128) = (
+    SELECT name FROM sys.endpoints WHERE type_desc = 'DATABASE_MIRRORING'
+);
+IF @ep IS NOT NULL
+BEGIN
+    EXEC(N'ALTER ENDPOINT [' + @ep + N'] STATE = STOPPED');
+    EXEC(N'ALTER ENDPOINT [' + @ep + N'] STATE = STARTED');
+END`
 }
 
 // ResolvingReplicasSQL returns a query that lists the replica_server_name of every
