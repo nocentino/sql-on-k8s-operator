@@ -274,6 +274,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileAGStatefulSet(ctx contex
 	sts.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
 	sts.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
 	sts.Spec.Template.Spec.Containers[0].Ports = desired.Spec.Template.Spec.Containers[0].Ports
+	sts.Spec.Template.Spec.Containers[0].Lifecycle = desired.Spec.Template.Spec.Containers[0].Lifecycle
 	sts.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
 	sts.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
 	return r.Update(ctx, sts)
@@ -1165,6 +1166,33 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 								{Name: "mssql-data", MountPath: "/var/opt/mssql"},
 								{Name: "mssql-conf", MountPath: "/var/opt/mssql/mssql.conf", SubPath: "mssql.conf"},
 							},
+							Lifecycle: &corev1.Lifecycle{
+								PostStart: &corev1.LifecycleHandler{
+									Exec: &corev1.ExecAction{
+										Command: []string{"/bin/bash", "-c", `
+for i in $(seq 1 30); do
+  /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -b -Q "SELECT 1" >/dev/null 2>&1 && break
+  sleep 1
+done
+HAS_AG=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -W -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.availability_groups" 2>/dev/null | head -1 | tr -d ' \r\n')
+if [ "$HAS_AG" = "0" ] || [ -z "$HAS_AG" ]; then exit 0; fi
+AG=""
+for i in $(seq 1 10); do
+  AG=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -W -h -1 -Q "SET NOCOUNT ON; SELECT TOP 1 ag.name FROM sys.availability_groups ag JOIN sys.dm_hadr_availability_replica_states ars ON ag.group_id = ars.group_id WHERE ars.is_local = 1 AND ars.role_desc = 'RESOLVING'" 2>/dev/null | head -1 | tr -d ' \r\n')
+  [ -n "$AG" ] && [ "$AG" != "(0rowsaffected)" ] && break
+  AG=""
+  sleep 1
+done
+if [ -n "$AG" ]; then
+  for a in $(seq 1 5); do
+    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -Q "ALTER AVAILABILITY GROUP [$AG] SET (ROLE = SECONDARY)" 2>&1 | grep -q 41104 || break
+    sleep 5
+  done
+fi
+exit 0`},
+									},
+								},
+							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
@@ -1332,9 +1360,9 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 // restarts and reconnects to the AG but remains in RESOLVING state indefinitely — SQL Server
 // requires the external cluster manager to explicitly grant it the SECONDARY role.
 //
-// When SET(ROLE=SECONDARY) fails with Msg 41104 ("previous error"), the operator simply
-// retries on the next reconcile. SQL Server's internal AG resource manager will clear
-// the previous error autonomously — matching the PDS agmonitor approach.
+// When SET(ROLE=SECONDARY) fails with Msg 41104 ("previous error"), the operator
+// issues ALTER AG OFFLINE + bilateral endpoint restart (on both the stuck replica
+// and the current primary) to clear stale transport state and force reconnection.
 func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (hadAny bool, err error) {
 	log := logf.FromContext(ctx)
 	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
@@ -1432,6 +1460,26 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		} else {
 			r.clear41104Tracking(ag, podName)
 			log.Info("Re-seated NOT SYNCHRONIZING replica", "pod", podName)
+
+			// Track how long this pod has been persistently NOT SYNCHRONIZING
+			// despite successful re-seats. If transport is stale (e.g. collateral
+			// damage from a bilateral endpoint restart on the primary for another
+			// replica), restart this secondary's endpoint to force reconnection.
+			stuckKey := ag.Namespace + "/" + ag.Name + "/" + podName + "/notSyncStuck"
+			now := time.Now()
+			firstRaw, _ := r.reseatFirstFailureTime.LoadOrStore(stuckKey, now)
+			firstTime := firstRaw.(time.Time)
+			stuckDur := now.Sub(firstTime)
+			if stuckDur >= 30*time.Second {
+				log.Info("Secondary persistently NOT SYNCHRONIZING despite successful re-seats; restarting HADR endpoint",
+					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
+				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+					sqlutil.RestartHADREndpointSQL()); epErr != nil {
+					log.Error(epErr, "Could not restart HADR endpoint on stuck secondary", "pod", podName)
+				}
+				// Reset the timer so we don't spam restarts — next attempt after another 30s
+				r.reseatFirstFailureTime.Store(stuckKey, now)
+			}
 		}
 	}
 	return hadAny, nil
@@ -1440,16 +1488,22 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 // handle41104 manages Msg 41104 failures ("The Availability Group resource manager
 // is waiting for a previous error to be resolved").
 //
-// Recovery strategy:
-//  1. Check the pod's local AG role.
-//  2. If it still reports PRIMARY (split-brain after planned failover), issue
-//     ALTER AVAILABILITY GROUP … OFFLINE to reset the AG resource state from
-//     PRIMARY → RESOLVING. This is the equivalent of Pacemaker's offlineAndWait().
-//  3. On the next reconcile, retry SET(ROLE=SECONDARY). The AG resource manager
-//     clears the "previous error" once the OFFLINE has reset the state machine.
+// Recovery strategy depends on the pod's local AG role:
 //
-// No endpoint restarts, no DROP/JOIN, no REMOVE/ADD — those risk triggering a
-// full re-seed if a log backup truncates the chain.
+//  1. LOCAL ROLE = PRIMARY (split-brain after planned failover):
+//     Issue ALTER AVAILABILITY GROUP … OFFLINE to reset the AG resource state
+//     from PRIMARY → RESOLVING. On the next reconcile SET(ROLE=SECONDARY) succeeds.
+//
+//  2. LOCAL ROLE = RESOLVING (unplanned failover — pod killed and restarted):
+//     The AG resource manager has stale primary metadata and a latched connection
+//     error. After a 30 s cooldown, issue ALTER AG OFFLINE + endpoint restart.
+//     OFFLINE clears the stale primary_replica metadata; endpoint restart forces
+//     the mirroring transport to reconnect to the actual primary. The transport
+//     needs ~30 s to re-establish, after which a subsequent SET(ROLE=SECONDARY)
+//     on the next reconcile succeeds.
+//
+// No DROP/JOIN, no REMOVE/ADD — those risk triggering a full re-seed if a log
+// backup truncates the chain between operations.
 func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 	ctx context.Context,
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
@@ -1479,6 +1533,46 @@ func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 		return
 	}
 
+	// RESOLVING case (unplanned failover): the AG resource has stale primary
+	// metadata and a latched connection error. After 30 s, issue OFFLINE +
+	// endpoint restart. The transport needs ~30 s to reconnect; the next
+	// reconcile cycle will retry SET(ROLE=SECONDARY).
+	// If the first attempt didn't work, retry every 90 s.
+	offlineKey := cooldownKey + "/offlineRestart"
+	lastRaw, offlineDone := r.reseatFirstFailureTime.Load(offlineKey)
+	canRetry := false
+	if offlineDone {
+		lastTime := lastRaw.(time.Time)
+		canRetry = now.Sub(lastTime) >= 90*time.Second
+	}
+
+	if (!offlineDone || canRetry) && stuckDuration >= 30*time.Second {
+		r.reseatFirstFailureTime.Store(offlineKey, now)
+		log.Info("Msg 41104; pod in RESOLVING — issuing ALTER AG OFFLINE + bilateral endpoint restart",
+			"pod", podName, "stuckFor", stuckDuration.Round(time.Second), "retry", canRetry)
+		if _, offErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+			sqlutil.SetAGOfflineSQL(ag.Spec.AGName)); offErr != nil {
+			log.Error(offErr, "Could not take AG OFFLINE on RESOLVING replica", "pod", podName)
+		}
+		// Restart endpoint on the SECONDARY (stuck replica) to clear stale connections.
+		if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+			sqlutil.RestartHADREndpointSQL()); epErr != nil {
+			log.Error(epErr, "Could not restart HADR endpoint on RESOLVING replica", "pod", podName)
+		}
+		// Restart endpoint on the PRIMARY too — the transport timeout is bilateral;
+		// the primary also caches stale connection state for the returning replica
+		// and won't attempt a fresh connection until its own endpoint is cycled.
+		if ag.Status.PrimaryReplica != "" && ag.Status.PrimaryReplica != podName {
+			log.Info("Restarting HADR endpoint on primary to clear bilateral transport state",
+				"primary", ag.Status.PrimaryReplica)
+			if _, epErr := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+				sqlutil.RestartHADREndpointSQL()); epErr != nil {
+				log.Error(epErr, "Could not restart HADR endpoint on primary", "pod", ag.Status.PrimaryReplica)
+			}
+		}
+		return
+	}
+
 	log.Info("Msg 41104; waiting for AG resource manager to clear previous error",
 		"pod", podName, "stuckFor", stuckDuration.Round(time.Second))
 }
@@ -1489,6 +1583,7 @@ func (r *SQLServerAvailabilityGroupReconciler) clear41104Tracking(
 ) {
 	cooldownKey := ag.Namespace + "/" + ag.Name + "/" + podName
 	r.reseatFirstFailureTime.Delete(cooldownKey)
+	r.reseatFirstFailureTime.Delete(cooldownKey + "/offlineRestart")
 }
 
 // queryAGDatabaseCount returns the number of databases in the AG as seen from the primary.
