@@ -106,7 +106,7 @@ For simple tasks:
 ## 7. Self-Improvement Loop
 
 After user corrections:
-- Record mistake in `tasks/lessons.md`
+- Record mistake in `docs/LESSONS.md`
 - Add rule to prevent recurrence
 - Review relevant lessons at start of work
 

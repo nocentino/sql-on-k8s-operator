@@ -29,4 +29,8 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
-tasks/*
+# Testing logs and generated artifacts
+testing/logs/
+
+# Generated manifests
+dist/install.yaml
