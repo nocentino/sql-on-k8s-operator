@@ -195,7 +195,8 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 	// old primary sometimes lose database synchronization with the new primary. Their
 	// replica role is SECONDARY but their databases are stuck in NOT SYNCHRONIZING state.
 	// Re-issuing SET (ROLE = SECONDARY) forces them to re-establish the database
-	// mirroring session with the new primary.
+	// mirroring session with the new primary. If that doesn't clear it, the operator
+	// escalates: secondary-only endpoint restart at 15s, bilateral restart at 30s.
 	var hadNotSynchronizing bool
 	if effectiveClusterType(ag.Spec.ClusterType) != agClusterTypeNone {
 		var nserr error
@@ -212,12 +213,14 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 
 	// Requeue sooner when RESOLVING or NOT SYNCHRONIZING replicas are active so the
 	// verify-retry loop converges faster than the normal 60s poll interval.
-	// 15s gives the endpoint restart logic visibility into recovery progress and catches
-	// successful autonomous transitions (RESOLVING→SECONDARY) quickly without hammering SQL.
+	// 5s gives the endpoint restart escalation logic (15s→secondary, 30s→bilateral)
+	// visibility into recovery progress and catches successful autonomous transitions
+	// (RESOLVING→SECONDARY) quickly without hammering SQL.
 	if hadResolving || hadNotSynchronizing {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	// Requeue periodically to keep status fresh and detect failovers
+	// Requeue periodically to keep status fresh; failover detection is event-driven
+	// via pod readiness watches (see SetupWithManager).
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
@@ -982,8 +985,9 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 
 	// If no live pod reported PRIMARY but the recorded primary is itself reporting
 	// SECONDARY, the status.primaryReplica is stale — this happens after an
-	// externally-initiated planned failover (e.g., ALTER AG FAILOVER run by a test)
-	// when the controller has not yet observed the new primary.
+	// externally-initiated planned failover (e.g., ALTER AG FAILOVER run by the
+	// preStop hook or by a test script) when the controller has not yet observed
+	// the new primary.
 	// Recover by identifying the unreachable pod as the inferred primary so that
 	// reconcileFailover can correctly detect the pod failure and start the timer.
 	if !foundPrimary && replicaRoles[ag.Status.PrimaryReplica] == agRoleSecondary {
@@ -1392,8 +1396,14 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 // in NOT SYNCHRONIZING state (CLUSTER_TYPE = EXTERNAL) and re-seats them by issuing
 // ALTER AVAILABILITY GROUP SET (ROLE = SECONDARY).
 //
-// When SET(ROLE=SECONDARY) fails with Msg 41104, the operator simply retries on the
-// next reconcile — same pattern as reconcileResolvingReplicas.
+// When SET(ROLE=SECONDARY) fails with Msg 41104, the operator delegates to handle41104
+// which issues ALTER AG OFFLINE + bilateral endpoint restart.
+//
+// When re-seats succeed but the replica remains NOT SYNCHRONIZING, the operator escalates:
+// - At 15s: restart the secondary's HADR endpoint (clears collateral damage).
+// - At 30s: escalate to bilateral restart (secondary + primary endpoints).
+// This handles both direct connectivity failures and bystander damage from primary
+// endpoint restarts triggered by recovery of other replicas.
 func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) (hadAny bool, err error) {
 	log := logf.FromContext(ctx)
 	if !ag.Status.InitializationComplete || ag.Status.PrimaryReplica == "" {
@@ -1515,11 +1525,12 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 //
 //  2. LOCAL ROLE = RESOLVING (unplanned failover — pod killed and restarted):
 //     The AG resource manager has stale primary metadata and a latched connection
-//     error. After a 30 s cooldown, issue ALTER AG OFFLINE + endpoint restart.
-//     OFFLINE clears the stale primary_replica metadata; endpoint restart forces
-//     the mirroring transport to reconnect to the actual primary. The transport
-//     needs ~30 s to re-establish, after which a subsequent SET(ROLE=SECONDARY)
-//     on the next reconcile succeeds.
+//     error. After 15 s, issue ALTER AG OFFLINE + bilateral endpoint restart
+//     (restart endpoints on both the stuck replica AND the current primary).
+//     The mirroring transport caches connection state on both sides — restarting
+//     only one side is insufficient. OFFLINE clears stale primary_replica metadata;
+//     bilateral endpoint restart forces fresh connections in both directions.
+//     If the first attempt fails, retry every 90 s.
 //
 // No DROP/JOIN, no REMOVE/ADD — those risk triggering a full re-seed if a log
 // backup truncates the chain between operations.

@@ -41,7 +41,9 @@ The operator provides two custom resources:
 - A read-write **listener** `Service` whose selector tracks the current PRIMARY replica
 - An optional read-only **listener** `Service` that targets readable SECONDARY replicas with `ClientIP` session affinity
 - Per-replica status (role, synchronization state, connected)
-- **Automatic unplanned failover** (when `clusterType: EXTERNAL`) — the operator promotes the best synchronous secondary when the primary pod is continuously unhealthy beyond a configurable threshold
+- **Automatic unplanned failover** (when `clusterType: EXTERNAL`) — the operator promotes the best synchronous secondary when the primary pod is continuously unhealthy beyond a configurable threshold, then recovers the restarted replica via bilateral HADR endpoint restarts
+- **Graceful planned failover via preStop hook** — rolling updates and node drains trigger `ALTER AVAILABILITY GROUP FAILOVER` on a synchronized secondary before SIGTERM, converting maintenance into zero-downtime events
+- **Two-tier endpoint restart escalation** — persistent NOT SYNCHRONIZING replicas are recovered with secondary-only restart at 15 s, escalating to bilateral restart (secondary + primary) at 30 s
 
 ## Quick Start
 
@@ -114,7 +116,7 @@ sqlcmd -S localhost,1433 -U sa -P 'YourStrong!Passw0rd' \
   -Q "SELECT @@SERVERNAME, role_desc FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1"
 ```
 
-The full annotated sample CR is at [`config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml`](config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml). The sample configures a three-replica AG (`clusterType: EXTERNAL`) with two synchronous replicas and one asynchronous replica, LoadBalancer listeners, and SQL Agent enabled. Key fields are documented in the [API Reference](#api-reference).
+The full annotated sample CR is at [`config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml`](config/samples/sql_v1alpha1_sqlserveravailabilitygroup.yaml). The sample configures a three-replica AG (`clusterType: EXTERNAL`) with two synchronous replicas and one asynchronous replica, LoadBalancer listeners, and SQL Agent enabled. A three-synchronous-replica variant for failover testing is available at [`config/samples/sql_v1alpha1_sqlserveravailabilitygroup_3sync.yaml`](config/samples/sql_v1alpha1_sqlserveravailabilitygroup_3sync.yaml). Key fields are documented in the [API Reference](#api-reference).
 
 ## Automatic Failover
 
@@ -173,6 +175,43 @@ spec:
     healthThreshold: resource
 ```
 
+### Planned failover (preStop hook)
+
+The operator sets a `preStop` lifecycle hook on every SQL Server container. When Kubernetes terminates the primary pod (rolling update, node drain, manual delete with grace period), the hook runs **before** SIGTERM while the pod is still fully alive:
+
+1. Query `sys.dm_hadr_availability_replica_states WHERE is_local = 1` to check if this pod is PRIMARY (`role = 1`). Exit immediately if not.
+2. Find a SYNCHRONIZED, CONNECTED secondary by joining replica states with `sys.availability_replicas`.
+3. Connect to the target secondary via its headless service FQDN and issue `sp_set_session_context @key = N'external_cluster', @value = N'yes'; ALTER AVAILABILITY GROUP [AG] FAILOVER`.
+4. The secondary atomically becomes PRIMARY — client connections redirect via the listener with zero dropped transactions.
+5. SIGTERM then fires on the now-demoted pod. Shutting down a secondary is completely benign.
+
+If no eligible secondary exists, the hook exits 0 immediately and Kubernetes proceeds with SIGTERM — falling back to unplanned failover. The hook always exits 0 to avoid blocking shutdown.
+
+**Net effect:** Rolling updates and node drains behave like planned failovers (~6 s recovery) instead of hard failures (~90 s with connection drops).
+
+### Unplanned failover (automatic promotion)
+
+When the primary pod crashes or is force-deleted (`--grace-period=0`), the preStop hook cannot run. The operator detects the failure through Kubernetes pod readiness and promotes a secondary:
+
+1. The kubelet marks the primary pod `NotReady`. The operator starts the `failoverThresholdSeconds` countdown.
+2. After the threshold expires (default 30 s), the operator selects the best synchronous secondary and issues `ALTER AVAILABILITY GROUP FAILOVER` on it.
+3. The new primary begins serving requests. The listener Service selector is updated.
+4. The killed pod restarts and re-joins the AG in `RESOLVING` state. The operator issues `SET (ROLE = SECONDARY)` to transition it.
+5. If `SET (ROLE = SECONDARY)` fails with Msg 41104 (stale AG resource state), the operator escalates:
+   - **If the pod still reports PRIMARY locally** (split-brain after planned failover): issue `ALTER AG OFFLINE` to reset from PRIMARY → RESOLVING.
+   - **If the pod is in RESOLVING** (unplanned failover): after 15 s, issue `ALTER AG OFFLINE` + bilateral HADR endpoint restart (restart endpoints on both the stuck replica and the current primary). The mirroring transport caches connection state on both sides — restarting only one side is insufficient.
+6. If the first bilateral restart doesn't resolve it, retry every 90 s.
+
+### Post-failover NOT SYNCHRONIZING recovery
+
+After any failover, secondaries may lose database synchronization with the new primary. Their replica role is SECONDARY but databases are stuck in NOT SYNCHRONIZING state. The operator handles this with two-tier escalation:
+
+1. Re-issue `SET (ROLE = SECONDARY)` to force re-establishment of the database mirroring session.
+2. If the replica remains NOT SYNCHRONIZING for 15 s despite successful re-seats, restart its HADR endpoint (clears collateral damage from bilateral restarts affecting bystander replicas).
+3. If still NOT SYNCHRONIZING at 30 s, escalate to bilateral restart (secondary + primary endpoints). Reset the timer and repeat the cycle.
+
+This layered approach handles both direct connectivity failures and collateral damage from primary endpoint restarts that affect uninvolved secondaries.
+
 ### Replica selection
 
 When a failover is triggered the operator selects the best available synchronous secondary:
@@ -201,12 +240,14 @@ With `CLUSTER_TYPE = EXTERNAL`, SQL Server persists each replica's synchronizati
 
 ### RESOLVING → SECONDARY after failover
 
-After an unplanned failover, the evicted primary pod restarts. With `CLUSTER_TYPE = EXTERNAL`, SQL Server leaves a restarted replica in `RESOLVING` state indefinitely — it waits for the external cluster manager to explicitly assign its role. On every reconcile the operator queries the current primary for any `RESOLVING` replicas and promotes them back to `SECONDARY`:
+After an unplanned failover, the evicted primary pod restarts. With `CLUSTER_TYPE = EXTERNAL`, SQL Server leaves a restarted replica in `RESOLVING` state indefinitely — it waits for the external cluster manager to explicitly assign its role. On every reconcile the operator queries the current primary for any `RESOLVING` replicas and transitions them to `SECONDARY`:
 
 ```sql
 ALTER AVAILABILITY GROUP [AG1]
   MODIFY REPLICA ON N'<pod-fqdn>' WITH (ROLE = SECONDARY);
 ```
+
+If this fails with Msg 41104, the operator issues `ALTER AG OFFLINE` + bilateral HADR endpoint restart to clear stale transport state (see [Unplanned failover](#unplanned-failover-automatic-promotion) above).
 
 ### Typical unplanned failover timeline
 
@@ -218,34 +259,24 @@ ALTER AVAILABILITY GROUP [AG1]
 | T+30 s | Threshold exceeded; best `SynchronousCommit`/`Automatic` replica selected |
 | T+~31 s | `ALTER AVAILABILITY GROUP FAILOVER` issued on target pod |
 | T+~32 s | New primary promoted; `status.primaryReplica` updated; listener Service re-pointed |
-| T+~60 s | Killed pod restarts; re-joins as `RESOLVING` |
-| T+~90 s | Operator issues `SET (ROLE = SECONDARY)`; full synchronization resumes |
+| T+~50 s | Killed pod restarts; re-joins as `RESOLVING` |
+| T+~55 s | Operator issues `SET (ROLE = SECONDARY)` — may fail with Msg 41104 (stale transport state) |
+| T+~70 s | `ALTER AG OFFLINE` + bilateral endpoint restart fires (secondary + primary endpoints cycled) |
+| T+~80 s | Transport reconnects; `SET (ROLE = SECONDARY)` succeeds on next reconcile |
+| T+~90 s | All replicas HEALTHY + SYNCHRONIZED |
 
 ### Graceful shutdown — preStop lifecycle hook
 
-Without intervention, every rolling update (`kubectl rollout restart`) or node drain on the primary pod triggers an **unplanned** failover — identical to a pod crash. Kubernetes sends SIGTERM, SQL Server shuts down, connections drop, and the surviving replicas spend 30–60 seconds electing a new primary.
-
-The operator sets a `preStop` lifecycle hook on every SQL Server container to convert this into a **planned** failover:
+The preStop hook is described in detail under [Planned failover](#planned-failover-prestop-hook) above. In summary:
 
 ```
 preStop → detect PRIMARY (role=1) → find SYNCHRONIZED secondary → connect to secondary
        → ALTER AG FAILOVER on secondary → secondary is now PRIMARY → SIGTERM on now-demoted pod
 ```
 
-**How it works:**
-
-1. Kubernetes runs the preStop hook **before** sending SIGTERM — the pod is still fully alive.
-2. The hook queries `sys.dm_hadr_availability_replica_states WHERE is_local = 1` to check whether this pod is the current PRIMARY (role = 1). If not, it exits immediately (no-op for secondaries).
-3. The hook queries for a SYNCHRONIZED, CONNECTED secondary by joining `sys.dm_hadr_availability_replica_states` with `sys.availability_replicas` to get the target's `replica_server_name` (headless service FQDN).
-4. The hook connects to the target secondary via its FQDN and port 1433, sets `sp_set_session_context @key = N'external_cluster', @value = N'yes'`, and issues `ALTER AVAILABILITY GROUP [AG] FAILOVER`.
-5. The secondary atomically becomes the new PRIMARY — client connections redirect via the listener, zero dropped transactions.
-6. SIGTERM then fires on the now-demoted pod — shutting down a former primary that has already handed off leadership is completely benign.
-
-If no SYNCHRONIZED/CONNECTED secondary is available, the hook bails out immediately (`exit 0`) and Kubernetes proceeds with SIGTERM — falling back to unplanned failover. The hook always exits 0 to avoid blocking shutdown.
-
 **Timing constraint:** The hook must complete within `terminationGracePeriodSeconds` (currently 30 s in the operator deployment). The planned failover itself takes ~6 s, well within the budget.
 
-**Net effect:** Rolling updates and node drains behave like planned failovers (~6 s recovery under load) instead of hard failures (~30–60 s with connection drops).
+**Net effect:** Rolling updates and node drains behave like planned failovers (~6 s recovery under load) instead of hard failures (~90 s with connection drops).
 
 ## API Reference
 
@@ -386,6 +417,23 @@ The K8s layer (pod readiness and `ag-role` label) and the SQL layer (role, sync 
 | After crashed pod recovered | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
 
 > **Note on the async replica (`mssql-ag-2`):** its steady-state `SyncState` is always `SYNCHRONIZING`, never `SYNCHRONIZED`. This is correct behavior for `AsynchronousCommit` — the replica continuously applies log as it arrives rather than holding transactions until the secondary acknowledges. The script only waits for the **synchronous** replica to reach `SYNCHRONIZED` before declaring the final health check.
+
+### Load testing under TPC-C
+
+The `mytesting/` directory contains scripts for automated failover testing with a real database under transactional load:
+
+| Script | Purpose |
+|--------|---------|
+| `test-a-load.sh` | Planned failover rotation (0→1→2→0) under HammerDB TPC-C load |
+| `test-b-load.sh` | Unplanned failover (force-delete primary ×3) under TPC-C load |
+| `test-c-load.sh` | PreStop hook validation (graceful delete ×3) under TPC-C load |
+
+**Prerequisites:**
+- A [HammerDB](https://github.com/nocentino/hammerdb) Docker setup with `hammerdb.env` pointing at the listener IP
+- TPCC-5G database (50 warehouses, ~6.3 GB) restored and added to the AG
+- Helper scripts: `monitor-ag.sh`, `logbackup-loop.sh`, `wait-synchronized.sh`
+
+Each script starts HammerDB TPC-C load, waits 5 minutes for steady state, then runs 3 rounds of failover with full health validation between rounds. HammerDB is stopped before each failover and restarted after recovery. Results and logs are saved to `mytesting/logs/`.
 
 ## Troubleshooting
 
