@@ -311,79 +311,15 @@ This mirrors the promote action in Microsoft's [mssql-server-ha](https://github.
 
 ## Testing Failover
 
-A self-contained test script, `test-ag-failover.sh`, ships with the repository. It deploys a three-replica AG, seeds a test database, and exercises both planned and unplanned automatic failover end-to-end with health checks at every state transition.
+See [testing.md](testing.md) for full details on test plans, scripts, and load testing under TPC-C.
 
-### Prerequisites
-
-- `kubectl` pointed at a cluster with the operator already deployed (see [Quick Start](#quick-start))
-- `sqlcmd` on your PATH — install via [mssql-tools18](https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-setup-tools)
-- `python3` for JSON pretty-printing of operator status
-
-### Phases
-
-| Phase | Command | What it does |
-|---|---|---|
-| 1 — Deploy | `deploy` | Tears down any existing AG, creates the SA secret, applies the sample CR, waits for pods Ready |
-| 2 — Verify | `verify` | Waits for `InitializationComplete=true`, shows pod labels, listeners, and initial health snapshot |
-| 3 — Add database | `adddb` | Creates `testdb`, backs it up, adds it to the AG, waits for sync replicas to reach `HEALTHY` |
-| 4 — Planned failover | `planned` | Issues `ALTER AG FAILOVER` on a sync secondary, waits for `status.primaryReplica` update |
-| 5 — Unplanned failover | `unplanned` | SIGKILLs `sqlservr` in the primary pod, confirms promotion and recovery to `SYNCHRONIZED` |
-
-### Running the full test
+A quick smoke test using `test-ag-failover.sh`:
 
 ```bash
-# Make the script executable (first time only)
-chmod +x test-ag-failover.sh
-
-# Run all five phases in order
 ./test-ag-failover.sh all
-
-# Or run phases individually
-./test-ag-failover.sh deploy
-./test-ag-failover.sh verify
-./test-ag-failover.sh adddb
-./test-ag-failover.sh planned
-./test-ag-failover.sh unplanned
 ```
 
-Override the SA password if yours differs from the default:
-
-```bash
-SA_PASSWORD='MyPassword!' ./test-ag-failover.sh all
-```
-
-### Health check output
-
-At each state transition the script prints K8s pod readiness and SQL replica health side by side (role, sync health, sync state, queue depths).
-
-### What to look for
-
-| Transition | Expected `SyncHealth` | Expected `SyncState` |
-|---|---|---|
-| Initial baseline (empty AG) | `NOT_HEALTHY` | `n/a` — no databases yet |
-| After `ADD DATABASE`, seeding in progress | Primary `HEALTHY`; secondaries `NOT_HEALTHY` | `NOT SYNCHRONIZING` → `SYNCHRONIZING` |
-| After seeding complete | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
-| Immediately after planned `FAILOVER` DDL | Old primary `NOT_HEALTHY` | `n/a` — mid-transition, listener re-pointing |
-| Planned failover settled | All `HEALTHY` | New primary; old primary `SYNCHRONIZED` |
-| After unplanned failover — new primary elected | Crashed pod `NOT_HEALTHY` | `RESOLVING` while SQL Server rejoins |
-| After crashed pod recovered | All `HEALTHY` | Sync replicas: `SYNCHRONIZED`; async replica: `SYNCHRONIZING` |
-
-### Load testing under TPC-C
-
-The `mytesting/` directory contains scripts for automated failover testing with a real database under transactional load:
-
-| Script | Purpose |
-|--------|---------|
-| `test-a-load.sh` | Planned failover rotation (0→1→2→0) under HammerDB TPC-C load |
-| `test-b-load.sh` | Unplanned failover (force-delete primary ×3) under TPC-C load |
-| `test-c-load.sh` | PreStop hook validation (graceful delete ×3) under TPC-C load |
-
-**Prerequisites:**
-- A [HammerDB](https://github.com/nocentino/hammerdb) Docker setup with `hammerdb.env` pointing at the listener IP
-- TPCC-5G database (50 warehouses, ~6.3 GB) restored and added to the AG
-- Helper scripts: `monitor-ag.sh`, `logbackup-loop.sh`, `wait-synchronized.sh`
-
-Each script starts HammerDB TPC-C load, waits 5 minutes for steady state, then runs 3 rounds of failover with full health validation between rounds. HammerDB is stopped before each failover and restarted after recovery. Results and logs are saved to `mytesting/logs/`.
+This deploys a three-replica AG, seeds a test database, and exercises both planned and unplanned failover with health checks at every state transition.
 
 ## Troubleshooting
 

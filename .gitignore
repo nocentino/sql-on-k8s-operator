@@ -29,6 +29,4 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
-# Failover testing scripts, logs, and generated artifacts
-mytesting/*
 tasks/*

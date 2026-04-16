@@ -6,7 +6,7 @@ You can remove any existing `sqlserveravailabilitygroup` resources, associated P
 
 Perform a clean deployment and validation of the 3-sync-replica Availability Group using the following sequence:
 
-Store all logs and outputs in a structured directory for post-test analysis in ./mytesting/logs
+Store all logs and outputs in a structured directory for post-test analysis in ./testing/logs
 
 1. **Environment Cleanup & Deployment**:
    - Delete any existing `sqlserveravailabilitygroup` resources, associated Pods, and PVCs.
@@ -37,7 +37,7 @@ Store all logs and outputs in a structured directory for post-test analysis in .
     - **Test B (Unplanned Failover)**: Simulate a hard failure by `SIGKILL`ing the SQL Server process or deleting the primary Pod 3 consecutive times. Allow the operator to detect the failure and perform an automatic promotion. Wait for the cluster to reach a steady `HEALTHY` state before the next kill.
 
 5. **Log Collection & Forensic Analysis**:
-    - Export the operator controller logs, store them in `./mytesting/logs/
+    - Export the operator controller logs, store them in `./testing/logs/
     - Capture the container logs (`stdout/stderr`) for all three `mssql` containers.
     - Execute `sp_readerrorlog` on all three replicas to capture internal SQL Server state transitions and errors.
     - Provide a summary analysis of the failover timings and any data hardening failures.
