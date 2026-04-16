@@ -359,33 +359,34 @@ BEGIN
 END`, agName, agName, clusterType, agName)
 }
 
-// AGDatabaseCountSQL returns a query that counts the number of databases
-// in the named AG on the local (primary) replica.
+// AGDatabaseNamesSQL returns a query that lists the database names in the
+// named AG on the local (primary) replica using DB_NAME() for reliable name
+// resolution.
 //
-// Used together with UserDatabaseCountSQL to detect automatic seeding in
-// progress: if the secondary's user-database count is less than the AG's
-// database count, seeding has not yet completed for at least one database
-// and SET (ROLE = SECONDARY) must not be issued (it cancels seeding).
-func AGDatabaseCountSQL(agName string) string {
+// Used together with SecondaryUserDatabaseNamesSQL to detect automatic seeding
+// in progress: if the secondary is missing a database that exists in the AG on
+// the primary, seeding has not yet completed for that database and
+// SET (ROLE = SECONDARY) must not be issued (it cancels seeding).
+func AGDatabaseNamesSQL(agName string) string {
 	return fmt.Sprintf(`SET NOCOUNT ON;
-SELECT COUNT(*)
+SELECT DB_NAME(drs.database_id)
 FROM sys.dm_hadr_database_replica_states drs
 JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
 WHERE ag.name = '%s' AND drs.is_local = 1;`, agName)
 }
 
-// UserDatabaseCountSQL returns a query that counts the number of online user
-// databases on the local replica (database_id > 4 excludes the four system
-// databases: master, tempdb, model, msdb).
+// SecondaryUserDatabaseNamesSQL returns a query that lists the names of online
+// user databases on the local replica using DB_NAME() for reliable name
+// resolution. database_id > 4 excludes the four system databases (master,
+// tempdb, model, msdb).
 //
-// Used together with AGDatabaseCountSQL to detect automatic seeding in progress.
-// A secondary whose online user-database count is less than the AG's database
-// count on the primary has not yet received all seeded databases — issuing
-// SET (ROLE = SECONDARY) on such a replica would cancel the in-flight seeding
-// operation (SQL Server internal reason code 215).
-func UserDatabaseCountSQL() string {
+// Used together with AGDatabaseNamesSQL to detect automatic seeding in progress.
+// A secondary that is missing an AG database has not yet received it via
+// seeding — issuing SET (ROLE = SECONDARY) on such a replica would cancel the
+// in-flight seeding operation (SQL Server internal reason code 215).
+func SecondaryUserDatabaseNamesSQL() string {
 	return `SET NOCOUNT ON;
-SELECT COUNT(*) FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE';`
+SELECT DB_NAME(database_id) FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE';`
 }
 
 // AGDatabasesSQL returns a query that lists the names of databases in the AG

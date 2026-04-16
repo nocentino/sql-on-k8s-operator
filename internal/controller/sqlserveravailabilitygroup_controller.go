@@ -21,12 +21,10 @@ import (
 	"fmt"
 	"maps"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -1095,6 +1093,7 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 		{Name: "ACCEPT_EULA", Value: acceptEULA},
 		{Name: "MSSQL_PID", Value: edition},
 		{Name: "MSSQL_AGENT_ENABLED", Value: "true"},
+		{Name: "AG_NAME", Value: ag.Spec.AGName},
 		{
 			Name: "SA_PASSWORD",
 			ValueFrom: &corev1.EnvVarSource{
@@ -1193,6 +1192,16 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 								PeriodSeconds:       15,
 								FailureThreshold:    3,
 								TimeoutSeconds:      10,
+							},
+							Lifecycle: &corev1.Lifecycle{
+								PreStop: &corev1.LifecycleHandler{
+									Exec: &corev1.ExecAction{
+										Command: []string{
+											"/bin/bash", "-c",
+											`ROLE=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -h -1 -W -Q "SET NOCOUNT ON; SELECT role FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1" 2>/dev/null | head -1 | tr -d '[:space:]'); if [ "$ROLE" != "1" ]; then exit 0; fi; TARGET=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -h -1 -W -Q "SET NOCOUNT ON; SELECT TOP 1 ar.replica_server_name FROM sys.dm_hadr_availability_replica_states ars JOIN sys.availability_replicas ar ON ars.replica_id = ar.replica_id WHERE ars.role_desc = 'SECONDARY' AND ars.synchronization_health_desc = 'HEALTHY' AND ars.connected_state_desc = 'CONNECTED'" 2>/dev/null | head -1 | tr -d '[:space:]'); if [ -z "$TARGET" ]; then exit 0; fi; SVC="${HOSTNAME%-*}-headless"; /opt/mssql-tools18/bin/sqlcmd -S "${TARGET}.${SVC},1433" -U sa -P "$MSSQL_SA_PASSWORD" -C -Q "EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes'; ALTER AVAILABILITY GROUP [$AG_NAME] FAILOVER;" 2>/dev/null; exit 0`,
+										},
+									},
+								},
 							},
 						},
 					},
@@ -1367,7 +1376,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
 			if strings.Contains(setErr.Error(), "41104") {
-				r.handle41104(ctx, ag, exec, saPassword, podName, log)
+				r.handle41104(ctx, ag, exec, saPassword, podName)
 			} else {
 				log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
 			}
@@ -1431,10 +1440,10 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		return true
 	})
 
-	agDBCount := r.queryAGDatabaseCount(ctx, ag, exec, saPassword)
+	agDBNames := r.queryAGDatabaseNames(ctx, ag, exec, saPassword)
 
 	for _, podName := range notSyncPods {
-		if agDBCount > 0 && r.isSeedingInProgress(ctx, ag, exec, saPassword, podName, agDBCount) {
+		if len(agDBNames) > 0 && r.isSeedingInProgress(ctx, ag, exec, saPassword, podName, agDBNames) {
 			log.Info("Automatic seeding in progress; skipping re-seat", "pod", podName)
 			continue
 		}
@@ -1445,7 +1454,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
 			if strings.Contains(setErr.Error(), "41104") {
-				r.handle41104(ctx, ag, exec, saPassword, podName, log)
+				r.handle41104(ctx, ag, exec, saPassword, podName)
 			} else {
 				log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
 			}
@@ -1457,20 +1466,38 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 			// despite successful re-seats. If transport is stale (e.g. collateral
 			// damage from a bilateral endpoint restart on the primary for another
 			// replica), restart this secondary's endpoint to force reconnection.
+			// If secondary-only restart doesn't help, escalate to bilateral restart.
 			stuckKey := ag.Namespace + "/" + ag.Name + "/" + podName + "/notSyncStuck"
 			now := time.Now()
 			firstRaw, _ := r.reseatFirstFailureTime.LoadOrStore(stuckKey, now)
 			firstTime := firstRaw.(time.Time)
 			stuckDur := now.Sub(firstTime)
-			if stuckDur >= 15*time.Second {
+			if stuckDur >= 30*time.Second {
+				// Secondary-only restart already tried; escalate to bilateral
+				log.Info("Secondary persistently NOT SYNCHRONIZING; escalating to bilateral endpoint restart",
+					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
+				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+					sqlutil.RestartHADREndpointSQL()); epErr != nil {
+					log.Error(epErr, "Could not restart HADR endpoint on stuck secondary", "pod", podName)
+				}
+				if ag.Status.PrimaryReplica != "" && ag.Status.PrimaryReplica != podName {
+					log.Info("Restarting HADR endpoint on primary to clear bilateral transport state",
+						"primary", ag.Status.PrimaryReplica)
+					if _, epErr := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+						sqlutil.RestartHADREndpointSQL()); epErr != nil {
+						log.Error(epErr, "Could not restart HADR endpoint on primary", "pod", ag.Status.PrimaryReplica)
+					}
+				}
+				// Reset timer — next cycle: secondary at 15s, bilateral at 30s
+				r.reseatFirstFailureTime.Store(stuckKey, now)
+			} else if stuckDur >= 15*time.Second {
 				log.Info("Secondary persistently NOT SYNCHRONIZING despite successful re-seats; restarting HADR endpoint",
 					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
 				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
 					sqlutil.RestartHADREndpointSQL()); epErr != nil {
 					log.Error(epErr, "Could not restart HADR endpoint on stuck secondary", "pod", podName)
 				}
-				// Reset the timer so we don't spam restarts — next attempt after another 15s
-				r.reseatFirstFailureTime.Store(stuckKey, now)
+				// Don't reset timer — allow escalation to bilateral at 30s
 			}
 		}
 	}
@@ -1501,8 +1528,8 @@ func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
 	exec *sqlutil.Executor,
 	saPassword, podName string,
-	log logr.Logger,
 ) {
+	log := logf.FromContext(ctx)
 	cooldownKey := ag.Namespace + "/" + ag.Name + "/" + podName
 
 	now := time.Now()
@@ -1578,54 +1605,69 @@ func (r *SQLServerAvailabilityGroupReconciler) clear41104Tracking(
 	r.reseatFirstFailureTime.Delete(cooldownKey + "/offlineRestart")
 }
 
-// queryAGDatabaseCount returns the number of databases in the AG as seen from the primary.
-// Returns 0 if the query fails (treated as unknown — seeding check is skipped).
-func (r *SQLServerAvailabilityGroupReconciler) queryAGDatabaseCount(
+// queryAGDatabaseNames returns the database names in the AG as seen from the primary.
+// Returns nil if the query fails (treated as unknown — seeding check is skipped).
+func (r *SQLServerAvailabilityGroupReconciler) queryAGDatabaseNames(
 	ctx context.Context,
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
 	exec *sqlutil.Executor,
 	saPassword string,
-) int {
+) []string {
 	res, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
-		sqlutil.AGDatabaseCountSQL(ag.Spec.AGName))
+		sqlutil.AGDatabaseNamesSQL(ag.Spec.AGName))
 	if err != nil {
-		return 0
+		return nil
 	}
-	n, parseErr := strconv.Atoi(strings.TrimSpace(res.Stdout))
-	if parseErr != nil {
-		return 0
+	var names []string
+	for line := range strings.SplitSeq(res.Stdout, "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			names = append(names, name)
+		}
 	}
-	return n
+	return names
 }
 
-// isSeedingInProgress returns true when the secondary pod has fewer online user
-// databases than the AG has on the primary, indicating that automatic seeding
-// has not yet completed for at least one database.
+// isSeedingInProgress returns true when the secondary pod is missing at least
+// one database that exists in the AG on the primary, indicating that automatic
+// seeding has not yet completed for that database.
 //
 // Automatic seeding creates the database on the secondary only after all pages
 // have been transferred. While seeding is in progress, sys.databases on the
-// secondary does not contain the database being seeded, so its online user-database
-// count will be less than the AG's database count on the primary.
+// secondary does not contain the database being seeded, so it will be absent
+// from the secondary's online user-database list.
+//
+// Database names are resolved with DB_NAME() on both sides for consistent
+// comparison, avoiding false positives when non-AG user databases exist on
+// a secondary.
 func (r *SQLServerAvailabilityGroupReconciler) isSeedingInProgress(
 	ctx context.Context,
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
 	exec *sqlutil.Executor,
 	saPassword string,
 	secondaryPod string,
-	agDatabaseCount int,
+	agDatabaseNames []string,
 ) bool {
 	res, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
-		sqlutil.UserDatabaseCountSQL())
+		sqlutil.SecondaryUserDatabaseNamesSQL())
 	if err != nil {
 		// Cannot connect to secondary; assume seeding is not in progress so
 		// the normal re-seat logic can handle a genuinely stuck replica.
 		return false
 	}
-	secCount, parseErr := strconv.Atoi(strings.TrimSpace(res.Stdout))
-	if parseErr != nil {
-		return false
+	secDBs := make(map[string]struct{})
+	for line := range strings.SplitSeq(res.Stdout, "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			secDBs[name] = struct{}{}
+		}
 	}
-	return secCount < agDatabaseCount
+	for _, agDB := range agDatabaseNames {
+		if _, exists := secDBs[agDB]; !exists {
+			return true
+		}
+	}
+	return false
 }
 
 // queryNotSynchronizingPods returns the pod names of secondaries with databases
@@ -1877,10 +1919,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 	}
 
 	// Primary is NotReady (or missing).
-	threshold := time.Duration(af.FailoverThresholdSeconds) * time.Second
-	if threshold < 10*time.Second {
-		threshold = 10 * time.Second
-	}
+	threshold := max(time.Duration(af.FailoverThresholdSeconds)*time.Second, 10*time.Second)
 	now := metav1.Now()
 
 	if ag.Status.PrimaryNotReadySince == nil {

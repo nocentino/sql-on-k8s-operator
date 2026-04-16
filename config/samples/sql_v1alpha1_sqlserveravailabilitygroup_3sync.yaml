@@ -6,7 +6,7 @@ metadata:
   namespace: default
 spec:
   agName: "AG1"
-  image: mcr.microsoft.com/mssql/server:2022-latest
+  image: mcr.microsoft.com/mssql/server:2025-CU3-ubuntu-22.04
   edition: Developer
   acceptEula: "Y"
   saPasswordSecretRef:

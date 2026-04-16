@@ -221,6 +221,32 @@ ALTER AVAILABILITY GROUP [AG1]
 | T+~60 s | Killed pod restarts; re-joins as `RESOLVING` |
 | T+~90 s | Operator issues `SET (ROLE = SECONDARY)`; full synchronization resumes |
 
+### Graceful shutdown — preStop lifecycle hook
+
+Without intervention, every rolling update (`kubectl rollout restart`) or node drain on the primary pod triggers an **unplanned** failover — identical to a pod crash. Kubernetes sends SIGTERM, SQL Server shuts down, connections drop, and the surviving replicas spend 30–60 seconds electing a new primary.
+
+The operator sets a `preStop` lifecycle hook on every SQL Server container to convert this into a **planned** failover:
+
+```
+preStop → detect PRIMARY (role=1) → find SYNCHRONIZED secondary → connect to secondary
+       → ALTER AG FAILOVER on secondary → secondary is now PRIMARY → SIGTERM on now-demoted pod
+```
+
+**How it works:**
+
+1. Kubernetes runs the preStop hook **before** sending SIGTERM — the pod is still fully alive.
+2. The hook queries `sys.dm_hadr_availability_replica_states WHERE is_local = 1` to check whether this pod is the current PRIMARY (role = 1). If not, it exits immediately (no-op for secondaries).
+3. The hook queries for a SYNCHRONIZED, CONNECTED secondary by joining `sys.dm_hadr_availability_replica_states` with `sys.availability_replicas` to get the target's `replica_server_name` (headless service FQDN).
+4. The hook connects to the target secondary via its FQDN and port 1433, sets `sp_set_session_context @key = N'external_cluster', @value = N'yes'`, and issues `ALTER AVAILABILITY GROUP [AG] FAILOVER`.
+5. The secondary atomically becomes the new PRIMARY — client connections redirect via the listener, zero dropped transactions.
+6. SIGTERM then fires on the now-demoted pod — shutting down a former primary that has already handed off leadership is completely benign.
+
+If no SYNCHRONIZED/CONNECTED secondary is available, the hook bails out immediately (`exit 0`) and Kubernetes proceeds with SIGTERM — falling back to unplanned failover. The hook always exits 0 to avoid blocking shutdown.
+
+**Timing constraint:** The hook must complete within `terminationGracePeriodSeconds` (currently 30 s in the operator deployment). The planned failover itself takes ~6 s, well within the budget.
+
+**Net effect:** Rolling updates and node drains behave like planned failovers (~6 s recovery under load) instead of hard failures (~30–60 s with connection drops).
+
 ## API Reference
 
 ### SQLServerInstance spec fields

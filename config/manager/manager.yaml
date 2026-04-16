@@ -21,7 +21,7 @@ spec:
     matchLabels:
       control-plane: controller-manager
       app.kubernetes.io/name: sql-on-k8s-operator
-  replicas: 1
+  replicas: 2
   template:
     metadata:
       annotations:
