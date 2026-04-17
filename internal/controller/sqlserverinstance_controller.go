@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -448,33 +449,38 @@ func (r *SQLServerInstanceReconciler) buildClusterIPService(instance *sqlv1alpha
 // buildMSSQLConf generates an mssql.conf INI file from a key-value map.
 // Keys are in "section.key" format (e.g., "memory.memorylimitmb").
 // Each unique [section] is emitted once with all its key=value pairs.
+//
+// The output is deterministic: toplevel entries and sections are emitted in
+// sorted order, and within a section keys are also sorted. Non-deterministic
+// output would otherwise trigger unnecessary ConfigMap Update calls on every
+// reconcile because Go map iteration order changes between runs.
 func buildMSSQLConf(conf map[string]string) string {
 	sections := map[string][]string{}
 	var toplevel []string
 
 	for k, v := range conf {
-		// Split on first dot to separate section from key
-		idx := -1
-		for i, c := range k {
-			if c == '.' {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
+		section, key, hasSection := strings.Cut(k, ".")
+		if !hasSection {
 			toplevel = append(toplevel, fmt.Sprintf("%s = %s", k, v))
 			continue
 		}
-		section := k[:idx]
-		key := k[idx+1:]
 		sections[section] = append(sections[section], fmt.Sprintf("%s = %s", key, v))
 	}
+
+	sort.Strings(toplevel)
+	sectionNames := make([]string, 0, len(sections))
+	for name := range sections {
+		sectionNames = append(sectionNames, name)
+	}
+	sort.Strings(sectionNames)
 
 	var result strings.Builder
 	for _, line := range toplevel {
 		result.WriteString(line + "\n")
 	}
-	for section, entries := range sections {
+	for _, section := range sectionNames {
+		entries := sections[section]
+		sort.Strings(entries)
 		result.WriteString(fmt.Sprintf("[%s]\n", section))
 		for _, e := range entries {
 			result.WriteString(e + "\n")

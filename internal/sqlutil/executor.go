@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -31,6 +32,13 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 )
+
+// DefaultExecTimeout caps every sqlcmd invocation. Without this bound a stuck
+// SQL Server (CrashLoopBackOff mid-exec, network-partitioned pod, etc.) can
+// hang a reconcile goroutine indefinitely. 30 s is long enough for the slowest
+// observed CREATE AVAILABILITY GROUP / JOIN operations and short enough to
+// keep the reconciler responsive.
+const DefaultExecTimeout = 30 * time.Second
 
 // Executor runs T-SQL statements inside a running SQL Server pod using kubectl exec.
 type Executor struct {
@@ -45,17 +53,34 @@ type ExecResult struct {
 }
 
 // ExecSQL executes a T-SQL query inside the named pod/container using sqlcmd.
-// The saPassword is used for the -P flag; callers must ensure it is retrieved
-// from the relevant Kubernetes Secret prior to calling this function.
+//
+// The SA password is NEVER passed on the sqlcmd command line (which would expose
+// it via the pod's /proc/*/cmdline). Instead, a shell wrapper reads the already-
+// populated MSSQL_SA_PASSWORD container environment variable — populated from
+// the same Kubernetes Secret the caller uses — and forwards it to sqlcmd via
+// the SQLCMDPASSWORD variable that sqlcmd consults before falling back to -P.
+// The query text is piped to sqlcmd's stdin (no argv exposure either).
+//
+// saPassword remains in the signature to let callers signal "we verified the
+// Secret exists and is reachable". It is intentionally unused by this function.
+//
+// ctx is automatically bounded by DefaultExecTimeout if the caller did not set
+// a deadline; this protects the reconciler from a stuck sqlcmd invocation.
 func (e *Executor) ExecSQL(ctx context.Context, namespace, podName, containerName, saPassword, query string) (ExecResult, error) {
+	_ = saPassword // see godoc — password flows via MSSQL_SA_PASSWORD env in the pod
+
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultExecTimeout)
+		defer cancel()
+	}
+
+	// The shell wrapper keeps the password out of argv. `exec` replaces the
+	// shell process so signal handling works as expected. -b makes sqlcmd exit
+	// non-zero on SQL errors; -C trusts self-signed TLS (mssql images default).
 	cmd := []string{
-		"/opt/mssql-tools18/bin/sqlcmd",
-		"-S", "localhost",
-		"-U", "sa",
-		"-P", saPassword,
-		"-Q", query,
-		"-C", // trust server certificate (self-signed in new installs)
-		"-b", // exit on error
+		"/bin/sh", "-c",
+		`SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" exec /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b`,
 	}
 
 	req := e.Client.CoreV1().RESTClient().Post().
@@ -66,6 +91,7 @@ func (e *Executor) ExecSQL(ctx context.Context, namespace, podName, containerNam
 		VersionedParams(&corev1.PodExecOptions{
 			Container: containerName,
 			Command:   cmd,
+			Stdin:     true,
 			Stdout:    true,
 			Stderr:    true,
 		}, scheme.ParameterCodec)
@@ -75,8 +101,11 @@ func (e *Executor) ExecSQL(ctx context.Context, namespace, podName, containerNam
 		return ExecResult{}, fmt.Errorf("could not create SPDY executor: %w", err)
 	}
 
+	// Append a trailing GO so sqlcmd actually executes the batch before EOF.
+	stdin := strings.NewReader(query + "\nGO\n")
 	var stdout, stderr bytes.Buffer
 	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  stdin,
 		Stdout: &stdout,
 		Stderr: &stderr,
 	})

@@ -115,6 +115,34 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 
 	log.Info("Reconciling SQLServerAvailabilityGroup", "name", ag.Name)
 
+	// --- Finalizer bookkeeping ---
+	// The finalizer blocks Kubernetes from fully deleting the CR until we have a
+	// chance to clean up in-memory controller state keyed off this AG (41104 and
+	// re-seat timers in r.reseatFirstFailureTime). Kubernetes owner references
+	// garbage-collect the StatefulSet, Services, and ConfigMap, but the sync.Map
+	// entries are controller-local and otherwise leak for the life of the pod.
+	if ag.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(ag, agFinalizer) {
+			controllerutil.AddFinalizer(ag, agFinalizer)
+			if err := r.Update(ctx, ag); err != nil {
+				return ctrl.Result{}, fmt.Errorf("could not add finalizer: %w", err)
+			}
+			// Re-fetch so subsequent patch bases reflect the new ResourceVersion.
+			if err := r.Get(ctx, req.NamespacedName, ag); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		if controllerutil.ContainsFinalizer(ag, agFinalizer) {
+			r.clearAllRecoveryState(ag)
+			controllerutil.RemoveFinalizer(ag, agFinalizer)
+			if err := r.Update(ctx, ag); err != nil {
+				return ctrl.Result{}, fmt.Errorf("could not remove finalizer: %w", err)
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// 1. Reconcile shared mssql.conf ConfigMap (hadr.hadrenabled = 1)
 	if err := r.reconcileAGConfigMap(ctx, ag); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not reconcile AG ConfigMap: %w", err)
@@ -341,6 +369,13 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileListenerService(ctx cont
 		Spec: corev1.ServiceSpec{
 			Type:     svcType,
 			Selector: selector,
+			// PublishNotReadyAddresses keeps the endpoint dialable even when the
+			// sole backing pod briefly toggles NotReady during a failover. Without
+			// this, clients see connection resets until the new primary receives its
+			// ag-role=primary label AND passes its readiness probe. The selector is
+			// already narrowed to ag-role=primary, so expanding to not-ready pods
+			// cannot accidentally route traffic to a secondary.
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{Name: "mssql", Port: listenerPort, TargetPort: intstr.FromInt32(listenerPort)},
 			},
@@ -395,6 +430,9 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileReadOnlyListenerService(
 			SessionAffinityConfig: &corev1.SessionAffinityConfig{
 				ClientIP: &corev1.ClientIPConfig{TimeoutSeconds: &affinityTimeoutSec},
 			},
+			// See comment on the read-write listener — the same rationale applies to
+			// read-only clients.
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{Name: "mssql", Port: listenerPort, TargetPort: intstr.FromInt32(listenerPort)},
 			},
@@ -445,29 +483,17 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcilePodLabels(ctx context.Co
 	// Build a lookup from pod name → readableSecondary flag from the spec.
 	readableByPod := make(map[string]bool, len(ag.Spec.Replicas))
 	for i := range ag.Spec.Replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		podName := podNameForReplica(ag, i)
 		readableByPod[podName] = ag.Spec.Replicas[i].ReadableSecondary
 	}
 
-	for i := range ag.Spec.Replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
-
-		// Assign label based on primary identity (SQL-confirmed or status-derived) and spec.
-		var desiredLabel string
-		if podName == primaryPod {
-			desiredLabel = "primary"
-		} else if readableByPod[podName] {
-			desiredLabel = "readable-secondary"
-		} else {
-			desiredLabel = "secondary"
-		}
-
+	patchPodLabel := func(podName, desiredLabel string) error {
 		pod := &corev1.Pod{}
 		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: ag.Namespace}, pod); err != nil {
-			continue // pod not yet scheduled — skip
+			return nil // pod not yet scheduled — skip silently
 		}
 		if pod.Labels[labelAGRole] == desiredLabel {
-			continue // already correct
+			return nil
 		}
 		patch := client.MergeFrom(pod.DeepCopy())
 		if pod.Labels == nil {
@@ -479,6 +505,36 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcilePodLabels(ctx context.Co
 			return err
 		}
 		log.Info("Updated pod AG role label", "pod", podName, "role", desiredLabel)
+		return nil
+	}
+
+	// Pass 1: promote the new primary FIRST. This ordering matters during failover:
+	// the listener Service selects only pods with ag-role=primary. If we demoted the
+	// old primary first, the Service endpoints would flap to empty until the new
+	// primary is labelled. Labelling the new primary first guarantees at least one
+	// backend is always present (may briefly be two during role transitions, which
+	// is harmless because only the replica truly in PRIMARY role will accept writes).
+	if primaryPod != "" {
+		if err := patchPodLabel(primaryPod, "primary"); err != nil {
+			return err
+		}
+	}
+
+	// Pass 2: demote all non-primaries.
+	for i := range ag.Spec.Replicas {
+		podName := podNameForReplica(ag, i)
+		if podName == primaryPod {
+			continue
+		}
+		var desiredLabel string
+		if readableByPod[podName] {
+			desiredLabel = "readable-secondary"
+		} else {
+			desiredLabel = "secondary"
+		}
+		if err := patchPodLabel(podName, desiredLabel); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -498,8 +554,8 @@ func (r *SQLServerAvailabilityGroupReconciler) joinSecondaries(
 	log := logf.FromContext(ctx)
 	replicas := ag.Spec.Replicas
 	for i := 1; i < len(replicas); i++ {
-		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
-		if _, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+		secondaryPod := podNameForReplica(ag, i)
+		if _, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword,
 			sqlutil.JoinAGSQL(ag.Spec.AGName, clusterType)); err != nil {
 			log.Error(err, "Could not join AG on secondary", "pod", secondaryPod)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}
@@ -512,7 +568,7 @@ func (r *SQLServerAvailabilityGroupReconciler) joinSecondaries(
 			// so retry a few times with a short delay (Msg 41104).
 			var setRoleErr error
 			for attempt := 1; attempt <= 3; attempt++ {
-				if _, setRoleErr = exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+				if _, setRoleErr = exec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword,
 					sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setRoleErr == nil {
 					break
 				}
@@ -545,7 +601,7 @@ func (r *SQLServerAvailabilityGroupReconciler) joinDatabasesOnSecondaries(
 	log := logf.FromContext(ctx)
 
 	// Discover databases in the AG from the primary.
-	result, err := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword,
+	result, err := exec.ExecSQL(ctx, ag.Namespace, primaryPod, containerName, saPassword,
 		sqlutil.AGDatabasesSQL(ag.Spec.AGName))
 	if err != nil {
 		log.Info("Could not query AG databases from primary; skipping database join", "err", err)
@@ -568,9 +624,9 @@ func (r *SQLServerAvailabilityGroupReconciler) joinDatabasesOnSecondaries(
 
 	// For each secondary, join each database using the idempotent command.
 	for i := 1; i < len(ag.Spec.Replicas); i++ {
-		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
+		secondaryPod := podNameForReplica(ag, i)
 		for _, dbName := range databases {
-			if _, joinErr := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+			if _, joinErr := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword,
 				sqlutil.JoinDatabaseToAGSQL(dbName, ag.Spec.AGName)); joinErr != nil {
 				log.Info("Could not join database on secondary (may not be restored yet)",
 					"database", dbName, "pod", secondaryPod, "err", joinErr)
@@ -608,8 +664,8 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 
 	// Step 1: Wait for all pods to be ready
 	for i := range replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
-		if !exec.IsReady(ctx, ag.Namespace, podName, "mssql", saPassword) {
+		podName := podNameForReplica(ag, i)
+		if !exec.IsReady(ctx, ag.Namespace, podName, containerName, saPassword) {
 			log.Info("Pod not yet ready, requeuing", "pod", podName)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
@@ -618,15 +674,15 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	// Step 2: Create master key, certificate, and HADR endpoint on every replica.
 	// Backup the DER-encoded cert to a well-known path on that pod's own PVC.
 	for i := range replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		podName := podNameForReplica(ag, i)
 		certName := certNameForPod(podName)
 		backupPath := fmt.Sprintf("/var/opt/mssql/data/%s.cer", certName)
 		for _, q := range []string{
 			sqlutil.CreateMasterKeySQL(masterKeyPw),
 			sqlutil.CreateCertificateSQL(certName, podName+" AG Certificate", backupPath),
-			sqlutil.CreateEndpointSQL("AGEP", certName, endpointPort),
+			sqlutil.CreateEndpointSQL(agEndpointName, certName, endpointPort),
 		} {
-			if _, err := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword, q); err != nil {
+			if _, err := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword, q); err != nil {
 				return ctrl.Result{}, fmt.Errorf("cert/endpoint setup failed on %s: %w", podName, err)
 			}
 		}
@@ -637,11 +693,11 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	// target pod using SPDY streaming (ReadFileFromPod → WriteFileToPod).
 	// This avoids any shared-storage requirement between pods.
 	for j := range replicas {
-		sourcePod := fmt.Sprintf("%s-%d", ag.Name, j)
+		sourcePod := podNameForReplica(ag, j)
 		sourceCertName := certNameForPod(sourcePod)
 		sourceCertPath := fmt.Sprintf("/var/opt/mssql/data/%s.cer", sourceCertName)
 
-		certBytes, err := exec.ReadFileFromPod(ctx, ag.Namespace, sourcePod, "mssql", sourceCertPath)
+		certBytes, err := exec.ReadFileFromPod(ctx, ag.Namespace, sourcePod, containerName, sourceCertPath)
 		if err != nil {
 			log.Error(err, "Could not read cert from pod", "pod", sourcePod)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
@@ -651,9 +707,9 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 			if i == j {
 				continue
 			}
-			targetPod := fmt.Sprintf("%s-%d", ag.Name, i)
+			targetPod := podNameForReplica(ag, i)
 			destPath := fmt.Sprintf("/var/opt/mssql/data/%s.cer", sourceCertName)
-			if err := exec.WriteFileToPod(ctx, ag.Namespace, targetPod, "mssql", destPath, certBytes); err != nil {
+			if err := exec.WriteFileToPod(ctx, ag.Namespace, targetPod, containerName, destPath, certBytes); err != nil {
 				log.Error(err, "Could not write cert to pod", "source", sourcePod, "target", targetPod)
 				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 			}
@@ -665,21 +721,21 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	// SQL Server HADR auth flow: connecting peer presents its cert → local instance
 	// validates it against the stored public cert → grants access via cert login.
 	for i := range replicas {
-		targetPod := fmt.Sprintf("%s-%d", ag.Name, i)
+		targetPod := podNameForReplica(ag, i)
 		for j := range replicas {
 			if i == j {
 				continue
 			}
-			sourcePod := fmt.Sprintf("%s-%d", ag.Name, j)
+			sourcePod := podNameForReplica(ag, j)
 			sourceCertName := certNameForPod(sourcePod)
 			destPath := fmt.Sprintf("/var/opt/mssql/data/%s.cer", sourceCertName)
 			loginName := fmt.Sprintf("%s_login", strings.ReplaceAll(sourcePod, "-", "_"))
 			for _, q := range []string{
 				sqlutil.RestoreCertificateSQL(sourceCertName, destPath),
 				sqlutil.CreateLoginFromCertSQL(loginName, sourceCertName),
-				sqlutil.GrantEndpointConnectSQL("AGEP", loginName),
+				sqlutil.GrantEndpointConnectSQL(agEndpointName, loginName),
 			} {
-				if _, err := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword, q); err != nil {
+				if _, err := exec.ExecSQL(ctx, ag.Namespace, targetPod, containerName, saPassword, q); err != nil {
 					log.Error(err, "Could not set up peer cert auth", "target", targetPod, "source", sourcePod)
 					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 				}
@@ -699,7 +755,7 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	primaryPod := fmt.Sprintf("%s-0", ag.Name)
 	hadrPort := fmt.Sprintf("%d", endpointPort)
 	for i := range replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		podName := podNameForReplica(ag, i)
 		fqdn := fmt.Sprintf("%s.%s", podName, headlessDomain)
 		addr := net.JoinHostPort(fqdn, hadrPort)
 		conn, dialErr := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -713,7 +769,7 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 
 	replicaInputs := make([]sqlutil.AGReplicaInput, len(replicas))
 	for i, rep := range replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		podName := podNameForReplica(ag, i)
 		replicaInputs[i] = sqlutil.AGReplicaInput{
 			PodName:           podName,
 			EndpointFQDN:      fmt.Sprintf("%s.%s", podName, headlessDomain),
@@ -724,7 +780,7 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	}
 	// CREATE AVAILABILITY GROUP cannot be wrapped in BEGIN...END in SQL Server.
 	// Check existence in Go and issue a plain CREATE only when the AG is absent.
-	existResult, err := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword,
+	existResult, err := exec.ExecSQL(ctx, ag.Namespace, primaryPod, containerName, saPassword,
 		sqlutil.AGExistsSQL(ag.Spec.AGName))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not check AG existence: %w", err)
@@ -743,7 +799,7 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 		clusterType := effectiveClusterType(ag.Spec.ClusterType)
 		createSQL := sqlutil.CreateAGSQL(ag.Spec.AGName, clusterType, replicaInputs, endpointPort)
 		log.Info("Creating Availability Group", "ag", ag.Spec.AGName, "clusterType", clusterType)
-		if _, createErr := exec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword, createSQL); createErr != nil {
+		if _, createErr := exec.ExecSQL(ctx, ag.Namespace, primaryPod, containerName, saPassword, createSQL); createErr != nil {
 			return ctrl.Result{}, fmt.Errorf("could not create AG on primary: %w", createErr)
 		}
 	} else {
@@ -805,12 +861,12 @@ func (r *SQLServerAvailabilityGroupReconciler) dropAGOnAllReplicas(
 	log.Info("Dropping AG on all replicas for clean recreation", "ag", ag.Spec.AGName)
 	dropSQL := fmt.Sprintf("DROP AVAILABILITY GROUP [%s]", ag.Spec.AGName)
 	for i := 1; i < replicaCount; i++ {
-		secondaryPod := fmt.Sprintf("%s-%d", ag.Name, i)
-		if _, err := sqlExec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword, dropSQL); err != nil {
+		secondaryPod := podNameForReplica(ag, i)
+		if _, err := sqlExec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword, dropSQL); err != nil {
 			log.Error(err, "Could not drop AG on secondary, continuing", "pod", secondaryPod)
 		}
 	}
-	if _, err := sqlExec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword, dropSQL); err != nil {
+	if _, err := sqlExec.ExecSQL(ctx, ag.Namespace, primaryPod, containerName, saPassword, dropSQL); err != nil {
 		log.Error(err, "Could not drop AG on primary, will requeue anyway")
 	}
 }
@@ -859,7 +915,7 @@ func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
 	log.Info("Waiting for secondaries to reach SECONDARY+CONNECTED state",
 		"ag", ag.Spec.AGName, "expected", wantSecondaries, "requiredConsecutive", requiredConsecutive)
 	for attempt := range maxAttempts {
-		result, qErr := sqlExec.ExecSQL(ctx, ag.Namespace, primaryPod, "mssql", saPassword,
+		result, qErr := sqlExec.ExecSQL(ctx, ag.Namespace, primaryPod, containerName, saPassword,
 			sqlutil.SecondaryCountSQL(ag.Spec.AGName))
 		if qErr != nil {
 			consecutiveOK = 0
@@ -954,9 +1010,9 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 	var statuses []sqlv1alpha1.AGReplicaStatus
 	foundPrimary := false
 	for i := range ag.Spec.Replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
-		role, _ := exec.GetAGRole(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
-		syncState, _ := exec.GetAGSyncState(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
+		podName := podNameForReplica(ag, i)
+		role, _ := exec.GetAGRole(ctx, ag.Namespace, podName, containerName, saPassword, ag.Spec.AGName)
+		syncState, _ := exec.GetAGSyncState(ctx, ag.Namespace, podName, containerName, saPassword, ag.Spec.AGName)
 		replicaRoles[podName] = role
 		if role == agRolePrimary {
 			ag.Status.PrimaryReplica = podName
@@ -993,7 +1049,7 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 	if !foundPrimary && replicaRoles[ag.Status.PrimaryReplica] == agRoleSecondary {
 		log := logf.FromContext(ctx)
 		for i := range ag.Spec.Replicas {
-			podName := fmt.Sprintf("%s-%d", ag.Name, i)
+			podName := podNameForReplica(ag, i)
 			if podName == ag.Status.PrimaryReplica {
 				continue
 			}
@@ -1172,10 +1228,7 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{
-											"/bin/bash", "-c",
-											`/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`,
-										},
+										Command: []string{"/bin/bash", "-c", probeScript},
 									},
 								},
 								InitialDelaySeconds: 90,
@@ -1186,10 +1239,7 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{
-											"/bin/bash", "-c",
-											`/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`,
-										},
+										Command: []string{"/bin/bash", "-c", probeScript},
 									},
 								},
 								InitialDelaySeconds: 45,
@@ -1200,10 +1250,7 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 							Lifecycle: &corev1.Lifecycle{
 								PreStop: &corev1.LifecycleHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{
-											"/bin/bash", "-c",
-											`ROLE=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -h -1 -W -Q "SET NOCOUNT ON; SELECT role FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1" 2>/dev/null | head -1 | tr -d '[:space:]'); if [ "$ROLE" != "1" ]; then exit 0; fi; TARGET=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -h -1 -W -Q "SET NOCOUNT ON; SELECT TOP 1 ar.replica_server_name FROM sys.dm_hadr_availability_replica_states ars JOIN sys.availability_replicas ar ON ars.replica_id = ar.replica_id WHERE ars.role_desc = 'SECONDARY' AND ars.synchronization_health_desc = 'HEALTHY' AND ars.connected_state_desc = 'CONNECTED'" 2>/dev/null | head -1 | tr -d '[:space:]'); if [ -z "$TARGET" ]; then exit 0; fi; SVC="${HOSTNAME%-*}-headless"; /opt/mssql-tools18/bin/sqlcmd -S "${TARGET}.${SVC},1433" -U sa -P "$MSSQL_SA_PASSWORD" -C -Q "EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes'; ALTER AVAILABILITY GROUP [$AG_NAME] FAILOVER;" 2>/dev/null; exit 0`,
-										},
+										Command: []string{"/bin/bash", "-c", preStopScript},
 									},
 								},
 							},
@@ -1291,7 +1338,7 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 
 	var bestEffort string // first configured sync/auto replica — used as fallback
 	for i, rep := range ag.Spec.Replicas {
-		podName := fmt.Sprintf("%s-%d", ag.Name, i)
+		podName := podNameForReplica(ag, i)
 		if podName == ag.Status.PrimaryReplica {
 			continue
 		}
@@ -1306,7 +1353,7 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 		// If the check fails (SQL Server temporarily unreachable), keep the candidate as
 		// best-effort rather than skipping it entirely. The FAILOVER command will be
 		// retried and will succeed once the target's SQL Server is ready to accept commands.
-		health, hErr := exec.GetAGSyncState(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
+		health, hErr := exec.GetAGSyncState(ctx, ag.Namespace, podName, containerName, saPassword, ag.Spec.AGName)
 		if hErr != nil {
 			log.Info("Could not check sync health for candidate; keeping as best-effort fallback",
 				"pod", podName, "err", hErr)
@@ -1359,7 +1406,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 		return false, err
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
-	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
 		sqlutil.ResolvingReplicasSQL(ag.Spec.AGName))
 	if err != nil {
 		log.Info("Could not query RESOLVING replicas from primary", "err", err)
@@ -1377,9 +1424,9 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 
 		log.Info("Detected RESOLVING secondary; transitioning to SECONDARY", "pod", podName)
 
-		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
-			if strings.Contains(setErr.Error(), "41104") {
+			if sqlutil.HasSQLError(sqlutil.ExecResult{}, setErr, sqlutil.ErrCodePreviousError) {
 				r.handle41104(ctx, ag, exec, saPassword, podName)
 			} else {
 				log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
@@ -1415,7 +1462,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 
-	actualRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword, ag.Spec.AGName)
+	actualRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword, ag.Spec.AGName)
 	if roleErr != nil {
 		log.Info("Could not verify primary role; skipping NOT SYNCHRONIZING check", "pod", ag.Status.PrimaryReplica, "err", roleErr)
 		return false, nil
@@ -1461,9 +1508,9 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		hadAny = true
 		log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)", "pod", podName)
 
-		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
-			if strings.Contains(setErr.Error(), "41104") {
+			if sqlutil.HasSQLError(sqlutil.ExecResult{}, setErr, sqlutil.ErrCodePreviousError) {
 				r.handle41104(ctx, ag, exec, saPassword, podName)
 			} else {
 				log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
@@ -1486,14 +1533,14 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 				// Secondary-only restart already tried; escalate to bilateral
 				log.Info("Secondary persistently NOT SYNCHRONIZING; escalating to bilateral endpoint restart",
 					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
-				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 					sqlutil.RestartHADREndpointSQL()); epErr != nil {
 					log.Error(epErr, "Could not restart HADR endpoint on stuck secondary", "pod", podName)
 				}
 				if ag.Status.PrimaryReplica != "" && ag.Status.PrimaryReplica != podName {
 					log.Info("Restarting HADR endpoint on primary to clear bilateral transport state",
 						"primary", ag.Status.PrimaryReplica)
-					if _, epErr := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+					if _, epErr := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
 						sqlutil.RestartHADREndpointSQL()); epErr != nil {
 						log.Error(epErr, "Could not restart HADR endpoint on primary", "pod", ag.Status.PrimaryReplica)
 					}
@@ -1503,7 +1550,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 			} else if stuckDur >= 15*time.Second {
 				log.Info("Secondary persistently NOT SYNCHRONIZING despite successful re-seats; restarting HADR endpoint",
 					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
-				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 					sqlutil.RestartHADREndpointSQL()); epErr != nil {
 					log.Error(epErr, "Could not restart HADR endpoint on stuck secondary", "pod", podName)
 				}
@@ -1552,11 +1599,11 @@ func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 	// PRIMARY locally even though the actual primary has changed.  Running OFFLINE
 	// resets the AG resource from PRIMARY → RESOLVING, allowing a subsequent
 	// SET(ROLE=SECONDARY) to succeed.
-	localRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, podName, "mssql", saPassword, ag.Spec.AGName)
+	localRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, podName, containerName, saPassword, ag.Spec.AGName)
 	if roleErr == nil && localRole == agRolePrimary {
 		log.Info("Msg 41104; pod still reports PRIMARY locally — issuing ALTER AG OFFLINE to reset state",
 			"pod", podName, "stuckFor", stuckDuration.Round(time.Second))
-		if _, offErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+		if _, offErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.SetAGOfflineSQL(ag.Spec.AGName)); offErr != nil {
 			log.Error(offErr, "Could not take AG OFFLINE on stuck primary", "pod", podName)
 		}
@@ -1580,12 +1627,12 @@ func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 		r.reseatFirstFailureTime.Store(offlineKey, now)
 		log.Info("Msg 41104; pod in RESOLVING — issuing ALTER AG OFFLINE + bilateral endpoint restart",
 			"pod", podName, "stuckFor", stuckDuration.Round(time.Second), "retry", canRetry)
-		if _, offErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+		if _, offErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.SetAGOfflineSQL(ag.Spec.AGName)); offErr != nil {
 			log.Error(offErr, "Could not take AG OFFLINE on RESOLVING replica", "pod", podName)
 		}
 		// Restart endpoint on the SECONDARY (stuck replica) to clear stale connections.
-		if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, "mssql", saPassword,
+		if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.RestartHADREndpointSQL()); epErr != nil {
 			log.Error(epErr, "Could not restart HADR endpoint on RESOLVING replica", "pod", podName)
 		}
@@ -1595,7 +1642,7 @@ func (r *SQLServerAvailabilityGroupReconciler) handle41104(
 		if ag.Status.PrimaryReplica != "" && ag.Status.PrimaryReplica != podName {
 			log.Info("Restarting HADR endpoint on primary to clear bilateral transport state",
 				"primary", ag.Status.PrimaryReplica)
-			if _, epErr := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+			if _, epErr := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
 				sqlutil.RestartHADREndpointSQL()); epErr != nil {
 				log.Error(epErr, "Could not restart HADR endpoint on primary", "pod", ag.Status.PrimaryReplica)
 			}
@@ -1624,7 +1671,7 @@ func (r *SQLServerAvailabilityGroupReconciler) queryAGDatabaseNames(
 	exec *sqlutil.Executor,
 	saPassword string,
 ) []string {
-	res, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+	res, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
 		sqlutil.AGDatabaseNamesSQL(ag.Spec.AGName))
 	if err != nil {
 		return nil
@@ -1659,7 +1706,7 @@ func (r *SQLServerAvailabilityGroupReconciler) isSeedingInProgress(
 	secondaryPod string,
 	agDatabaseNames []string,
 ) bool {
-	res, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, "mssql", saPassword,
+	res, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword,
 		sqlutil.SecondaryUserDatabaseNamesSQL())
 	if err != nil {
 		// Cannot connect to secondary; assume seeding is not in progress so
@@ -1689,7 +1736,7 @@ func (r *SQLServerAvailabilityGroupReconciler) queryNotSynchronizingPods(
 	exec *sqlutil.Executor,
 	saPassword string,
 ) []string {
-	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, "mssql", saPassword,
+	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
 		sqlutil.NotSynchronizingReplicasSQL(ag.Spec.AGName))
 	if err != nil {
 		logf.FromContext(ctx).Info("Could not query NOT SYNCHRONIZING replicas from primary", "err", err)
@@ -1733,18 +1780,18 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 
-	actualRole, _ := exec.GetAGRole(ctx, ag.Namespace, primaryPodName, "mssql", saPassword, ag.Spec.AGName)
+	actualRole, _ := exec.GetAGRole(ctx, ag.Namespace, primaryPodName, containerName, saPassword, ag.Spec.AGName)
 	if actualRole != agRoleSecondary && actualRole != agRoleResolving {
 		return ctrl.Result{}, nil // pod IS primary (or SQL unreachable) — nothing to do
 	}
 
 	// Pod is K8s-Ready but NOT serving as primary. Check if another pod is.
 	for i := range ag.Spec.Replicas {
-		candidatePod := fmt.Sprintf("%s-%d", ag.Name, i)
+		candidatePod := podNameForReplica(ag, i)
 		if candidatePod == primaryPodName {
 			continue
 		}
-		role, _ := exec.GetAGRole(ctx, ag.Namespace, candidatePod, "mssql", saPassword, ag.Spec.AGName)
+		role, _ := exec.GetAGRole(ctx, ag.Namespace, candidatePod, containerName, saPassword, ag.Spec.AGName)
 		if role == agRolePrimary {
 			log.Info("Correcting stale primary record; another pod is PRIMARY",
 				"old", primaryPodName, "new", candidatePod)
@@ -1767,7 +1814,7 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
+	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, containerName, saPassword,
 		sqlutil.FailoverSQL(ag.Spec.AGName))
 	if foErr != nil {
 		if isUnsynchronizedError(foRes, foErr) {
@@ -1805,11 +1852,7 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 // This matches Microsoft's mssql-server-ha behaviour: ag-helper checks for this error
 // and returns OCF_ERR_GENERIC to Pacemaker, never falling back to FORCE_FAILOVER.
 func isUnsynchronizedError(res sqlutil.ExecResult, err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(res.Stdout, "41142") ||
-		strings.Contains(err.Error(), "41142")
+	return sqlutil.HasSQLError(res, err, sqlutil.ErrCodeNotSynchronized)
 }
 
 // primaryDiagsUnhealthy runs sp_server_diagnostics on the named pod and returns true
@@ -1838,7 +1881,7 @@ func (r *SQLServerAvailabilityGroupReconciler) primaryDiagsUnhealthy(
 	}
 
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
-	diag, err := exec.CheckServerDiagnostics(ctx, ag.Namespace, podName, "mssql", saPassword)
+	diag, err := exec.CheckServerDiagnostics(ctx, ag.Namespace, podName, containerName, saPassword)
 	if err != nil {
 		// SQL Server temporarily unreachable — treat conservatively as healthy.
 		// The K8s readiness probe will flip the pod to NotReady if it truly fails.
@@ -1966,7 +2009,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 		return ctrl.Result{}, err
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
-	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, "mssql", saPassword,
+	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, containerName, saPassword,
 		sqlutil.FailoverSQL(ag.Spec.AGName))
 	if foErr != nil {
 		if isUnsynchronizedError(foRes, foErr) {

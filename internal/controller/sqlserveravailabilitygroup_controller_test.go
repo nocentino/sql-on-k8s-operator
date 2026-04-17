@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -140,7 +141,19 @@ var _ = Describe("SQLServerAvailabilityGroup Controller", func() {
 	AfterEach(func() {
 		obj := &sqlv1alpha1.SQLServerAvailabilityGroup{}
 		if err := k8sClient.Get(ctx, nn, obj); err == nil {
+			// Strip the operator finalizer so envtest (which has no running
+			// controller) can fully delete the object between specs. The real
+			// controller removes the finalizer itself on CR deletion.
+			if len(obj.Finalizers) > 0 {
+				obj.Finalizers = nil
+				_ = k8sClient.Update(ctx, obj)
+			}
 			_ = k8sClient.Delete(ctx, obj)
+			// Block until the object is gone so the next BeforeEach's Create
+			// does not race with a pending deletion.
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, nn, &sqlv1alpha1.SQLServerAvailabilityGroup{}))
+			}, "5s", "100ms").Should(BeTrue())
 		}
 		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 			Name: agName + "-mssql-conf", Namespace: namespace}})

@@ -34,3 +34,5 @@ testing/logs/
 
 # Generated manifests
 dist/install.yaml
+
+tasks/*
