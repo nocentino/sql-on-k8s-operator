@@ -2,8 +2,13 @@
 
 A Kubernetes operator for **SQL Server on Linux** that automates the full lifecycle of standalone instances and Always On Availability Groups (AG).
 
+## About
+
+For a detailed introduction to see [Introducing sql-on-k8s-operator](https://www.nocentino.com/posts/2026-04-12-introducing-sql-on-k8s-operator/).
+
 ## Table of Contents
 
+- [About](#about)
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Automatic Failover](#automatic-failover)
