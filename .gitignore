@@ -32,7 +32,5 @@ go.work
 # Testing logs and generated artifacts
 testing/logs/
 
-# Generated manifests
-dist/install.yaml
-
+# Task notes and plans
 tasks/*
