@@ -1493,7 +1493,7 @@ metadata:
   name: sql-on-k8s-operator-controller-manager
   namespace: sql-on-k8s-operator-system
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: sql-on-k8s-operator
@@ -1513,7 +1513,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: nocentino/sql-on-k8s-operator:0.27
+        image: nocentino/sql-on-k8s-operator:latest
         imagePullPolicy: IfNotPresent
         livenessProbe:
           httpGet:

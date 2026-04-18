@@ -1420,6 +1420,14 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 			continue
 		}
 		podName := replicaName
+
+		// Guard: never re-seat the primary — same rationale as in
+		// reconcileNotSynchronizingReplicas.
+		if podName == ag.Status.PrimaryReplica {
+			log.Info("Skipping re-seat: pod is the current primary", "pod", podName)
+			continue
+		}
+
 		hadAny = true
 
 		log.Info("Detected RESOLVING secondary; transitioning to SECONDARY", "pod", podName)
@@ -1500,6 +1508,17 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 	agDBNames := r.queryAGDatabaseNames(ctx, ag, exec, saPassword)
 
 	for _, podName := range notSyncPods {
+		// Guard: never re-seat the primary. After a planned failover the
+		// outgoing primary's DMVs can briefly report the new primary as a
+		// NOT SYNCHRONIZING SECONDARY before the role change propagates.
+		// If the query ran against a stale PrimaryReplica value the new
+		// primary ends up in notSyncPods. Re-seating it triggers Msg 41104
+		// → ALTER AG OFFLINE, which wrecks the primary.
+		if podName == ag.Status.PrimaryReplica {
+			log.Info("Skipping re-seat: pod is the current primary", "pod", podName)
+			continue
+		}
+
 		if len(agDBNames) > 0 && r.isSeedingInProgress(ctx, ag, exec, saPassword, podName, agDBNames) {
 			log.Info("Automatic seeding in progress; skipping re-seat", "pod", podName)
 			continue
