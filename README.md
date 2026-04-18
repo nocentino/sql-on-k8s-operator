@@ -241,6 +241,18 @@ ALTER AVAILABILITY GROUP [AG1] FAILOVER;
 
 This mirrors the promote action in Microsoft's [mssql-server-ha](https://github.com/microsoft/mssql-server-ha) ag-helper. SQL Server verifies from its local copy of the AG configuration that the target replica had received every committed transaction. If not, it rejects the command with **error 41142** and the operator retries on the next reconcile. `FORCE_FAILOVER_ALLOW_DATA_LOSS` is never used.
 
+### Typical planned failover timeline
+
+| Time | Event |
+|---|---|
+| T+0 s | `ALTER AVAILABILITY GROUP FAILOVER` issued on a SYNCHRONIZED secondary |
+| T+~1 s | Target secondary atomically becomes PRIMARY; old primary demotes to SECONDARY in-place |
+| T+~2 s | Operator detects role change; updates `status.primaryReplica`; listener Service re-points via `ag-role=primary` label |
+| T+~10 s | Demoted replica re-establishes database mirroring session with the new primary |
+| T+~60 s | All replicas HEALTHY + SYNCHRONIZED |
+
+No pod is killed — the old primary stays running and transitions to SECONDARY. Recovery time is dominated by the demoted replica re-synchronizing its databases with the new primary.
+
 ### Typical unplanned failover timeline
 
 | Time | Event |
@@ -251,11 +263,22 @@ This mirrors the promote action in Microsoft's [mssql-server-ha](https://github.
 | T+30 s | Threshold exceeded; best `SynchronousCommit`/`Automatic` replica selected |
 | T+~31 s | `ALTER AVAILABILITY GROUP FAILOVER` issued on target pod |
 | T+~32 s | New primary promoted; `status.primaryReplica` updated; listener Service re-pointed |
-| T+~50 s | Killed pod restarts; re-joins as `RESOLVING` |
-| T+~55 s | Operator issues `SET (ROLE = SECONDARY)` — may fail with Msg 41104 (stale transport state) |
-| T+~70 s | `ALTER AG OFFLINE` + bilateral endpoint restart fires (secondary + primary endpoints cycled) |
-| T+~80 s | Transport reconnects; `SET (ROLE = SECONDARY)` succeeds on next reconcile |
-| T+~90 s | All replicas HEALTHY + SYNCHRONIZED |
+| T+~55 s | Killed pod restarts; re-joins as `RESOLVING` |
+| T+~60 s | Operator issues `SET (ROLE = SECONDARY)` — may fail with Msg 41104 (stale transport state) |
+| T+~75 s | `ALTER AG OFFLINE` + bilateral endpoint restart fires (secondary + primary endpoints cycled) |
+| T+~90 s | Transport reconnects; `SET (ROLE = SECONDARY)` succeeds on next reconcile |
+| T+~120 s | All replicas HEALTHY + SYNCHRONIZED |
+
+### Measured failover results (v0.41, 3-node AKS, 3 synchronous replicas)
+
+Average wall-clock time from initiation to all replicas HEALTHY + SYNCHRONIZED (3 rounds each):
+
+| Scenario | Stub DB (no load) | TPC-C 5 GB (under load) |
+|---|---|---|
+| **Planned failover** | ~60 s | ~88 s |
+| **Unplanned failover** | ~131 s | ~110 s |
+
+Planned failover completes the role switch in seconds; the bulk of the time is the demoted replica restarting and re-synchronizing. Unplanned failover adds the 30 s `failoverThresholdSeconds` wait plus the 41104 recovery path (ALTER AG OFFLINE + bilateral endpoint restart).
 
 ## API Reference
 
