@@ -196,21 +196,31 @@ When the primary pod crashes or is force-deleted (`--grace-period=0`), the preSt
 1. The kubelet marks the primary pod `NotReady`. The operator starts the `failoverThresholdSeconds` countdown.
 2. After the threshold expires (default 30 s), the operator selects the best synchronous secondary and issues `ALTER AVAILABILITY GROUP FAILOVER` on it.
 3. The new primary begins serving requests. The listener Service selector is updated.
-4. The killed pod restarts and re-joins the AG in `RESOLVING` state. The operator issues `SET (ROLE = SECONDARY)` to transition it.
+4. The killed pod restarts and re-joins the AG in `RESOLVING` state. The operator issues `SET (ROLE = SECONDARY)` to transition it. A **primary guard** ensures the operator never re-seats the pod recorded as the current primary — after a planned failover, the outgoing primary's DMVs can briefly report the new primary as a RESOLVING secondary, and re-seating it would wreck the AG.
 5. If `SET (ROLE = SECONDARY)` fails with Msg 41104 (stale AG resource state), the operator escalates:
    - **If the pod still reports PRIMARY locally** (split-brain after planned failover): issue `ALTER AG OFFLINE` to reset from PRIMARY → RESOLVING.
    - **If the pod is in RESOLVING** (unplanned failover): after 15 s, issue `ALTER AG OFFLINE` + bilateral HADR endpoint restart (restart endpoints on both the stuck replica and the current primary). The mirroring transport caches connection state on both sides — restarting only one side is insufficient.
 6. If the first bilateral restart doesn't resolve it, retry every 90 s.
 
+### Headless AG detection
+
+After an unplanned kill + pod restart, the recorded primary may come back K8s-Ready but serving as SECONDARY or RESOLVING — leaving the AG with no active PRIMARY. On every reconcile the operator verifies the recorded primary's actual SQL role:
+
+1. If another pod is already PRIMARY (e.g. a preStop-triggered failover completed before the operator noticed), the operator corrects `status.primaryReplica` and requeues.
+2. If **no** pod is PRIMARY, the AG is headless. The operator triggers an immediate failover to the best synchronous secondary — bypassing the `failoverThresholdSeconds` timer since the AG is already degraded.
+
+This catches edge cases where the NotReady timer never fires because the pod is technically Ready but not serving as PRIMARY.
+
 ### Post-failover NOT SYNCHRONIZING recovery
 
 After any failover, secondaries may lose database synchronization with the new primary. Their replica role is SECONDARY but databases are stuck in NOT SYNCHRONIZING state. The operator handles this with two-tier escalation:
 
-1. Re-issue `SET (ROLE = SECONDARY)` to force re-establishment of the database mirroring session.
-2. If the replica remains NOT SYNCHRONIZING for 15 s despite successful re-seats, restart its HADR endpoint (clears collateral damage from bilateral restarts affecting bystander replicas).
-3. If still NOT SYNCHRONIZING at 30 s, escalate to bilateral restart (secondary + primary endpoints). Reset the timer and repeat the cycle.
+1. Re-issue `SET (ROLE = SECONDARY)` to force re-establishment of the database mirroring session. The **primary guard** ensures the operator never re-seats the pod recorded as the current primary — stale DMV data after a planned failover can briefly report the new primary as a NOT SYNCHRONIZING secondary.
+2. If the replica is actively seeding (automatic seeding has not yet delivered all databases), the operator skips re-seating to avoid destabilising the data transfer.
+3. If the replica remains NOT SYNCHRONIZING for 15 s despite successful re-seats, restart its HADR endpoint (clears collateral damage from bilateral restarts affecting bystander replicas).
+4. If still NOT SYNCHRONIZING at 30 s, escalate to bilateral restart (secondary + primary endpoints). Reset the timer and repeat the cycle.
 
-This layered approach handles both direct connectivity failures and collateral damage from primary endpoint restarts that affect uninvolved secondaries.
+This layered approach handles direct connectivity failures, collateral damage from primary endpoint restarts, and transient DMV inconsistencies after role transitions.
 
 ### Replica selection
 
