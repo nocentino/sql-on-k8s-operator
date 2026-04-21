@@ -266,6 +266,14 @@ type SQLServerAvailabilityGroupStatus struct {
 	// +optional
 	PrimaryNotReadySince *metav1.Time `json:"primaryNotReadySince,omitempty"`
 
+	// BootstrapAttempts counts how many times the operator has dropped and
+	// retried the AG bootstrap because secondaries failed to converge. After
+	// maxBootstrapAttempts the operator stops retrying and surfaces a
+	// BootstrapFailed condition so the loop cannot indefinitely drop and
+	// recreate the AG. Reset to 0 when bootstrap succeeds.
+	// +optional
+	BootstrapAttempts int32 `json:"bootstrapAttempts,omitempty"`
+
 	// Conditions represent the current state of the AG.
 	// +listType=map
 	// +listMapKey=type

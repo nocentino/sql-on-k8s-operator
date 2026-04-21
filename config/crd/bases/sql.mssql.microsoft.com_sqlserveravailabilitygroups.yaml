@@ -448,6 +448,15 @@ spec:
             description: SQLServerAvailabilityGroupStatus defines the observed state
               of the AG.
             properties:
+              bootstrapAttempts:
+                description: |-
+                  BootstrapAttempts counts how many times the operator has dropped and
+                  retried the AG bootstrap because secondaries failed to converge. After
+                  maxBootstrapAttempts the operator stops retrying and surfaces a
+                  BootstrapFailed condition so the loop cannot indefinitely drop and
+                  recreate the AG. Reset to 0 when bootstrap succeeds.
+                format: int32
+                type: integer
               conditions:
                 description: Conditions represent the current state of the AG.
                 items:

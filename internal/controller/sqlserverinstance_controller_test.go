@@ -90,6 +90,13 @@ var _ = Describe("SQLServerInstance Controller", func() {
 	var reconciler *SQLServerInstanceReconciler
 
 	BeforeEach(func() {
+		// Create the SA password Secret that the reconciler now requires up-front.
+		saSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "mssql-test-secret", Namespace: namespace},
+			Data:       map[string][]byte{"SA_PASSWORD": []byte("P@ssw0rd!")},
+		}
+		Expect(k8sClient.Create(ctx, saSecret)).To(Succeed())
+
 		instance = &sqlv1alpha1.SQLServerInstance{
 			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: namespace},
 			Spec: sqlv1alpha1.SQLServerInstanceSpec{
@@ -131,6 +138,8 @@ var _ = Describe("SQLServerInstance Controller", func() {
 			Name: instanceName, Namespace: namespace}})
 		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{
 			Name: instanceName + "-headless", Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Name: "mssql-test-secret", Namespace: namespace}})
 	})
 
 	It("reconciles without error", func() {

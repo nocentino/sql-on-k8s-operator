@@ -38,6 +38,7 @@ import (
 
 	sqlv1alpha1 "github.com/anocentino/sql-on-k8s-operator/api/v1alpha1"
 	"github.com/anocentino/sql-on-k8s-operator/internal/controller"
+	webhookv1alpha1 "github.com/anocentino/sql-on-k8s-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -177,7 +178,7 @@ func main() {
 		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
-		setupLog.Error(err, "Failed to start manager")
+		setupLog.Error(err, "Failed to create manager")
 		os.Exit(1)
 	}
 
@@ -204,6 +205,20 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "SQLServerAvailabilityGroup")
 		os.Exit(1)
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupSQLServerInstanceWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "SQLServerInstance")
+			os.Exit(1)
+		}
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupSQLServerAvailabilityGroupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "SQLServerAvailabilityGroup")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 

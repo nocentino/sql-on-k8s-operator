@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"net"
@@ -87,7 +89,31 @@ const (
 	// agClusterTypeNone is the T-SQL cluster type string for standalone (read-scale) mode.
 	// Defined as a named constant to satisfy goconst and give callsites a self-documenting name.
 	agClusterTypeNone = "NONE"
+
+	// maxBilateralRestarts caps how many bilateral HADR endpoint restarts the
+	// operator issues against a single stuck secondary before giving up and
+	// surfacing a ReplicaRecoveryFailed condition for operator intervention.
+	// Each bilateral restart disrupts every secondary (the primary endpoint is
+	// cycled), so unbounded retries amplify an isolated failure into fleet-wide
+	// churn.
+	maxBilateralRestarts = 5
+
+	// bilateralRestartBaseBackoff is the base delay between bilateral restart
+	// attempts. The effective delay is base * 2^attempts, capped at
+	// bilateralRestartMaxBackoff.
+	bilateralRestartBaseBackoff = 30 * time.Second
+	bilateralRestartMaxBackoff  = 10 * time.Minute
 )
+
+// bilateralRestartState tracks how many bilateral HADR endpoint restarts have
+// been issued against a stuck secondary and when the most recent attempt ran.
+// Stored in SQLServerAvailabilityGroupReconciler.reseatFirstFailureTime under
+// a "/bilateralAttempts" suffix so it shares lifetime management (and the
+// mass-recovery cleanup loop) with the existing reseat tracking.
+type bilateralRestartState struct {
+	count       int
+	lastAttempt time.Time
+}
 
 // +kubebuilder:rbac:groups=sql.mssql.microsoft.com,resources=sqlserveravailabilitygroups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=sql.mssql.microsoft.com,resources=sqlserveravailabilitygroups/status,verbs=get;update;patch
@@ -95,7 +121,7 @@ const (
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
@@ -237,6 +263,15 @@ func (r *SQLServerAvailabilityGroupReconciler) Reconcile(ctx context.Context, re
 	// 9. Reconcile PV reclaim policy for all replica PVCs.
 	if err := r.reconcilePVCReclaimPolicy(ctx, ag); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not reconcile PV reclaim policy: %w", err)
+	}
+
+	// 10. Monitor endpoint certificate expiry. Does not rotate certs; surfaces a
+	// CertificateExpiring status condition when the earliest cert across reachable
+	// replicas has < 90 days remaining so operators can rotate manually.
+	if ag.Status.InitializationComplete {
+		if err := r.reconcileCertificateExpiry(ctx, ag); err != nil {
+			log.Info("Could not check certificate expiry; will retry next cycle", "err", err)
+		}
 	}
 
 	// Requeue sooner when RESOLVING or NOT SYNCHRONIZING replicas are active so the
@@ -560,7 +595,7 @@ func (r *SQLServerAvailabilityGroupReconciler) joinSecondaries(
 			log.Error(err, "Could not join AG on secondary", "pod", secondaryPod)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}
 		}
-		log.Info("Joined AG on secondary", "pod", secondaryPod)
+		log.Info("JOIN command succeeded on secondary (awaiting role transition)", "pod", secondaryPod, "ag", ag.Spec.AGName)
 		if clusterType != agClusterTypeNone {
 			// Transition from RESOLVING → SECONDARY so SQL Server reports the replica
 			// as SECONDARY+CONNECTED and the operator's health monitoring can proceed.
@@ -660,7 +695,10 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	}
 	replicas := ag.Spec.Replicas
 	headlessDomain := fmt.Sprintf("%s-headless.%s.svc.cluster.local", ag.Name, ag.Namespace)
-	masterKeyPw := saPassword + "_mk"
+	masterKeyPw, err := r.getOrCreateMasterKeyPassword(ctx, ag)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("could not obtain master key password: %w", err)
+	}
 
 	// Step 1: Wait for all pods to be ready
 	for i := range replicas {
@@ -830,16 +868,73 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 	// the AG from scratch, and the TCP-reachability check (Step 5) will ensure the HADR
 	// endpoints are reachable before CREATE AVAILABILITY GROUP runs.
 	if !r.waitForSecondariesReady(ctx, exec, ag, primaryPod, saPassword, len(replicas)) {
+		// Circuit breaker: after maxBootstrapAttempts failed DROP-and-recreate
+		// cycles, stop dropping so operators can inspect the broken state
+		// instead of an infinite destructive loop.
+		if ag.Status.BootstrapAttempts >= maxBootstrapAttempts {
+			log.Info("Bootstrap attempt limit reached; not dropping AG again",
+				"ag", ag.Spec.AGName, "attempts", ag.Status.BootstrapAttempts)
+			r.patchBootstrapFailed(ctx, ag)
+			return ctrl.Result{}, nil
+		}
+		attempt := ag.Status.BootstrapAttempts + 1
+		log.Info("Secondaries did not converge; dropping AG for clean retry",
+			"ag", ag.Spec.AGName, "attempt", attempt)
 		r.dropAGOnAllReplicas(ctx, exec, ag, primaryPod, saPassword, len(replicas))
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		// Persist the attempt counter and surface a best-effort status condition.
+		patch := client.MergeFrom(ag.DeepCopy())
+		ag.Status.BootstrapAttempts = attempt
+		if perr := r.Status().Patch(ctx, ag, patch); perr != nil {
+			log.Info("Could not persist BootstrapAttempts", "err", perr)
+		}
+		// Exponential backoff between attempts: 15s, 30s, 60s ... capped at 10m.
+		backoff := time.Duration(15) * time.Second << (attempt - 1)
+		if backoff <= 0 || backoff > 10*time.Minute {
+			backoff = 10 * time.Minute
+		}
+		return ctrl.Result{RequeueAfter: backoff}, nil
 	}
 
-	log.Info("AG bootstrap complete", "ag", ag.Spec.AGName)
 	patch := client.MergeFrom(ag.DeepCopy())
 	ag.Status.InitializationComplete = true
 	ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
 	ag.Status.PrimaryReplica = primaryPod
-	return ctrl.Result{}, r.Status().Patch(ctx, ag, patch)
+	ag.Status.BootstrapAttempts = 0
+	if err := r.Status().Patch(ctx, ag, patch); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("AG bootstrap complete", "ag", ag.Spec.AGName)
+	return ctrl.Result{}, nil
+}
+
+// maxBootstrapAttempts caps how many times bootstrapAG is allowed to drop and
+// recreate the AG when secondaries fail to converge. Each DROP cleans every
+// replica's AG metadata so bounded retries matter: without a cap a broken
+// cluster loops forever, and with too small a cap transient DNS or pod-start
+// races fail permanently. Three attempts spanning ~105s of exponential
+// backoff (15s, 30s, 60s) is the empirical sweet spot.
+const maxBootstrapAttempts int32 = 3
+
+// patchBootstrapFailed surfaces a Degraded/BootstrapFailed condition on the AG
+// after the circuit breaker trips so the situation is visible via kubectl.
+func (r *SQLServerAvailabilityGroupReconciler) patchBootstrapFailed(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+) {
+	log := logf.FromContext(ctx)
+	patch := client.MergeFrom(ag.DeepCopy())
+	ag.Status.Phase = sqlv1alpha1.AGPhaseFailed
+	apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+		Type:               "BootstrapFailed",
+		Status:             metav1.ConditionTrue,
+		Reason:             "BootstrapAttemptLimitReached",
+		Message:            fmt.Sprintf("AG bootstrap failed %d times; manual intervention required", ag.Status.BootstrapAttempts),
+		ObservedGeneration: ag.Generation,
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.Status().Patch(ctx, ag, patch); err != nil {
+		log.Info("Could not patch BootstrapFailed condition", "err", err)
+	}
 }
 
 // dropAGOnAllReplicas drops the named AG on every replica so each instance
@@ -951,7 +1046,7 @@ func (r *SQLServerAvailabilityGroupReconciler) waitForSecondariesReady(
 					"ag", ag.Spec.AGName, "count", secondaryCount, "expected", wantSecondaries)
 			} else {
 				log.Info("Secondaries not yet ready, retrying",
-					"count", secondaryCount, "expected", wantSecondaries, "attempt", attempt)
+					"ag", ag.Spec.AGName, "count", secondaryCount, "expected", wantSecondaries, "attempt", attempt)
 			}
 			consecutiveOK = 0
 		}
@@ -984,6 +1079,81 @@ func (r *SQLServerAvailabilityGroupReconciler) getSAPassword(ctx context.Context
 		return "", fmt.Errorf("key %q not found in secret %s/%s", ref.Key, ag.Namespace, ref.Name)
 	}
 	return string(pw), nil
+}
+
+// masterKeySecretName returns the deterministic Secret name that holds the
+// per-AG database master key password. Isolated from the SA password Secret
+// so rotating one does not affect the other.
+func masterKeySecretName(ag *sqlv1alpha1.SQLServerAvailabilityGroup) string {
+	return ag.Name + "-master-key"
+}
+
+// getOrCreateMasterKeyPassword returns the password used to encrypt the SQL
+// Server database master key on every replica, persisting it in a dedicated
+// Kubernetes Secret owned by the AG CR.
+//
+// First call generates a cryptographically random 32-byte password, stores it
+// in <ag>-master-key (key "password"), and returns it. Subsequent calls read
+// the existing Secret. This replaces the previous derivation of
+// "<saPassword>_mk", which was trivially predictable once the SA password was
+// known and leaked the master key derivation across otherwise-isolated AGs
+// sharing a password.
+func (r *SQLServerAvailabilityGroupReconciler) getOrCreateMasterKeyPassword(
+	ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+) (string, error) {
+	secret := &corev1.Secret{}
+	name := masterKeySecretName(ag)
+	getErr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ag.Namespace}, secret)
+	if getErr == nil {
+		pw, ok := secret.Data["password"]
+		if !ok || len(pw) == 0 {
+			return "", fmt.Errorf("master key secret %s/%s is missing the \"password\" key", ag.Namespace, name)
+		}
+		return string(pw), nil
+	}
+	if !errors.IsNotFound(getErr) {
+		return "", getErr
+	}
+
+	// Generate 32 random bytes → 64-char hex. Hex (not base64) avoids T-SQL
+	// literal escaping concerns because every character is in [0-9a-f].
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("could not generate master key password: %w", err)
+	}
+	pw := hex.EncodeToString(buf)
+
+	newSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ag.Namespace,
+			Labels: map[string]string{
+				"app":                          ag.Name,
+				"app.kubernetes.io/managed-by": "sql-on-k8s-operator",
+				"app.kubernetes.io/component":  "ag-master-key",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"password": []byte(pw)},
+	}
+	if err := controllerutil.SetControllerReference(ag, newSecret, r.Scheme); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, newSecret); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return "", err
+		}
+		// Another reconcile beat us to it — re-read the authoritative value.
+		if err2 := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ag.Namespace}, secret); err2 != nil {
+			return "", err2
+		}
+		pwBytes, ok := secret.Data["password"]
+		if !ok || len(pwBytes) == 0 {
+			return "", fmt.Errorf("master key secret %s/%s is missing the \"password\" key", ag.Namespace, name)
+		}
+		return string(pwBytes), nil
+	}
+	return pw, nil
 }
 
 // updateAGStatus refreshes replica roles and sync state from all pods.
@@ -1048,14 +1218,20 @@ func (r *SQLServerAvailabilityGroupReconciler) updateAGStatus(ctx context.Contex
 	// reconcileFailover can correctly detect the pod failure and start the timer.
 	if !foundPrimary && replicaRoles[ag.Status.PrimaryReplica] == agRoleSecondary {
 		log := logf.FromContext(ctx)
+		unreachableCount := 0
+		for i := range ag.Spec.Replicas {
+			if replicaRoles[podNameForReplica(ag, i)] == "" {
+				unreachableCount++
+			}
+		}
 		for i := range ag.Spec.Replicas {
 			podName := podNameForReplica(ag, i)
 			if podName == ag.Status.PrimaryReplica {
 				continue
 			}
 			if replicaRoles[podName] == "" { // GetAGRole failed → pod unreachable
-				log.Info("Correcting stale primary: recorded primary is SECONDARY, inferred primary from unreachable pod",
-					"stale", ag.Status.PrimaryReplica, "inferred", podName)
+				log.Info("Correcting stale primary: recorded primary is SECONDARY, guessed primary from first unreachable pod",
+					"ag", ag.Spec.AGName, "stale", ag.Status.PrimaryReplica, "guessed", podName, "unreachableCount", unreachableCount)
 				ag.Status.PrimaryReplica = podName
 				break
 			}
@@ -1272,7 +1448,7 @@ func (r *SQLServerAvailabilityGroupReconciler) buildAGStatefulSet(ag *sqlv1alpha
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "mssql-data"},
+					ObjectMeta: metav1.ObjectMeta{Name: "mssql-data", Labels: labels},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes:      accessModes,
 						StorageClassName: ag.Spec.Storage.StorageClassName,
@@ -1336,7 +1512,11 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 
-	var bestEffort string // first configured sync/auto replica — used as fallback
+	// Split the best-effort fallback into two tiers: a reachable-but-not-HEALTHY
+	// replica is always preferred over an unreachable replica because FAILOVER
+	// against an unreachable pod will itself fail and force another reconcile.
+	var bestEffortReachable string   // reachable but not HEALTHY
+	var bestEffortUnreachable string // sync health query failed (SQL unreachable)
 	for i, rep := range ag.Spec.Replicas {
 		podName := podNameForReplica(ag, i)
 		if podName == ag.Status.PrimaryReplica {
@@ -1355,10 +1535,10 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 		// retried and will succeed once the target's SQL Server is ready to accept commands.
 		health, hErr := exec.GetAGSyncState(ctx, ag.Namespace, podName, containerName, saPassword, ag.Spec.AGName)
 		if hErr != nil {
-			log.Info("Could not check sync health for candidate; keeping as best-effort fallback",
+			log.Info("Could not check sync health for candidate; keeping as unreachable best-effort fallback",
 				"pod", podName, "err", hErr)
-			if bestEffort == "" {
-				bestEffort = podName
+			if bestEffortUnreachable == "" {
+				bestEffortUnreachable = podName
 			}
 			continue
 		}
@@ -1370,17 +1550,23 @@ func (r *SQLServerAvailabilityGroupReconciler) selectFailoverTarget(ctx context.
 		}
 
 		// Reachable but not HEALTHY (e.g. primary just died, replica is transitioning).
-		// Record as best-effort fallback; keep searching for a HEALTHY candidate.
-		if bestEffort == "" {
-			bestEffort = podName
+		// Preferred over an unreachable replica because the subsequent FAILOVER
+		// command at least has a live SQL Server to return 41142 or succeed.
+		if bestEffortReachable == "" {
+			bestEffortReachable = podName
 		}
-		log.Info("Candidate not HEALTHY; keeping as best-effort fallback", "pod", podName, "health", health)
+		log.Info("Candidate not HEALTHY; keeping as reachable best-effort fallback", "pod", podName, "health", health)
 	}
 
-	if bestEffort != "" {
-		log.Info("No HEALTHY replica found; using best-effort replica for force failover",
-			"pod", bestEffort)
-		return bestEffort, nil
+	if bestEffortReachable != "" {
+		log.Info("No HEALTHY replica found; using reachable best-effort replica for failover",
+			"pod", bestEffortReachable)
+		return bestEffortReachable, nil
+	}
+	if bestEffortUnreachable != "" {
+		log.Info("No HEALTHY or reachable replica found; using unreachable best-effort replica for failover",
+			"pod", bestEffortUnreachable)
+		return bestEffortUnreachable, nil
 	}
 
 	return "", fmt.Errorf("no SynchronousCommit replica with failoverMode=Automatic available for automatic failover")
@@ -1406,10 +1592,29 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 		return false, err
 	}
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+
+	// Verify the recorded primary is actually serving as PRIMARY before querying
+	// RESOLVING replicas against it — mirrors the guard in
+	// reconcileNotSynchronizingReplicas. If the recorded primary is stale (e.g.
+	// mid-failover), running this query against the wrong pod can return a
+	// misleading set and cause the operator to issue SET(ROLE=SECONDARY) against
+	// the genuine new primary, triggering Msg 41104 and ALTER AG OFFLINE.
+	actualRole, roleErr := exec.GetAGRole(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword, ag.Spec.AGName)
+	if roleErr != nil {
+		log.Info("Could not verify primary role; skipping RESOLVING recovery", "pod", ag.Status.PrimaryReplica, "err", roleErr)
+		return false, nil
+	}
+	if actualRole != agRolePrimary {
+		log.Info("Recorded primary is not in PRIMARY role; skipping RESOLVING recovery",
+			"pod", ag.Status.PrimaryReplica, "role", actualRole)
+		return false, nil
+	}
+
 	result, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
 		sqlutil.ResolvingReplicasSQL(ag.Spec.AGName))
 	if err != nil {
-		log.Info("Could not query RESOLVING replicas from primary", "err", err)
+		log.Error(err, "Could not query RESOLVING replicas from primary; skipping recovery this cycle",
+			"pod", ag.Status.PrimaryReplica)
 		return false, nil
 	}
 
@@ -1432,9 +1637,9 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileResolvingReplicas(ctx co
 
 		log.Info("Detected RESOLVING secondary; transitioning to SECONDARY", "pod", podName)
 
-		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
+		if setRes, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
-			if sqlutil.HasSQLError(sqlutil.ExecResult{}, setErr, sqlutil.ErrCodePreviousError) {
+			if sqlutil.HasSQLError(setRes, setErr, sqlutil.ErrCodePreviousError) {
 				r.handle41104(ctx, ag, exec, saPassword, podName)
 			} else {
 				log.Error(setErr, "Could not set SECONDARY role on RESOLVING replica", "pod", podName)
@@ -1486,7 +1691,9 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 		return false, nil
 	}
 
-	// Clean up stale /notSyncStuck tracking keys for pods that recovered.
+	// Clean up stale /notSyncStuck and /bilateralAttempts tracking keys for
+	// pods that recovered. A pod is considered recovered when it no longer
+	// appears in notSyncPods this cycle.
 	notSyncSet := make(map[string]struct{}, len(notSyncPods))
 	for _, p := range notSyncPods {
 		notSyncSet[p] = struct{}{}
@@ -1494,18 +1701,23 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 	prefix := ag.Namespace + "/" + ag.Name + "/"
 	r.reseatFirstFailureTime.Range(func(key, _ any) bool {
 		s, ok := key.(string)
-		if !ok || !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, "/notSyncStuck") {
+		if !ok || !strings.HasPrefix(s, prefix) {
 			return true
 		}
-		pod := strings.TrimPrefix(s, prefix)
-		pod = strings.TrimSuffix(pod, "/notSyncStuck")
+		var pod string
+		switch {
+		case strings.HasSuffix(s, "/notSyncStuck"):
+			pod = strings.TrimSuffix(strings.TrimPrefix(s, prefix), "/notSyncStuck")
+		case strings.HasSuffix(s, "/bilateralAttempts"):
+			pod = strings.TrimSuffix(strings.TrimPrefix(s, prefix), "/bilateralAttempts")
+		default:
+			return true
+		}
 		if _, still := notSyncSet[pod]; !still {
 			r.reseatFirstFailureTime.Delete(key)
 		}
 		return true
 	})
-
-	agDBNames := r.queryAGDatabaseNames(ctx, ag, exec, saPassword)
 
 	for _, podName := range notSyncPods {
 		// Guard: never re-seat the primary. After a planned failover the
@@ -1519,17 +1731,28 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 			continue
 		}
 
-		if len(agDBNames) > 0 && r.isSeedingInProgress(ctx, ag, exec, saPassword, podName, agDBNames) {
-			log.Info("Automatic seeding in progress; skipping re-seat", "pod", podName)
+		// Only skip a re-seat when SQL Server reports an active automatic
+		// seeding operation for this secondary (internal_state_desc IN
+		// INITIALIZING / WAITING_FOR_DATA / RUNNING in sys.dm_hadr_automatic_seeding).
+		// SET (ROLE = SECONDARY) during an active seed cancels the VDI restore
+		// (reason 215). Transient non-ONLINE states on the secondary (RESTORING
+		// on SQL startup, brief RECOVERY_PENDING after a pod recreate) are NOT
+		// true seeding and must NOT block the re-seat.
+		if active := r.activeAutomaticSeeding(ctx, ag, exec, saPassword, podName); len(active) > 0 {
+			secondaryStates := r.secondaryDatabaseStates(ctx, ag, exec, saPassword, podName)
+			log.Info("VDI automatic seeding in progress on primary; skipping re-seat",
+				"pod", podName, "seedingStates", active, "secondaryDatabaseStates", secondaryStates)
 			continue
 		}
 
 		hadAny = true
-		log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)", "pod", podName)
+		dbStates := r.secondaryDatabaseStates(ctx, ag, exec, saPassword, podName)
+		log.Info("Detected NOT SYNCHRONIZING secondary; re-seating with SET(ROLE=SECONDARY)",
+			"pod", podName, "databases", dbStates)
 
-		if _, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
+		if setRes, setErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
 			sqlutil.SetRoleToSecondarySQL(ag.Spec.AGName)); setErr != nil {
-			if sqlutil.HasSQLError(sqlutil.ExecResult{}, setErr, sqlutil.ErrCodePreviousError) {
+			if sqlutil.HasSQLError(setRes, setErr, sqlutil.ErrCodePreviousError) {
 				r.handle41104(ctx, ag, exec, saPassword, podName)
 			} else {
 				log.Error(setErr, "Could not re-seat NOT SYNCHRONIZING replica", "pod", podName)
@@ -1549,7 +1772,15 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 			firstTime := firstRaw.(time.Time)
 			stuckDur := now.Sub(firstTime)
 			if stuckDur >= 30*time.Second {
-				// Secondary-only restart already tried; escalate to bilateral
+				// Secondary-only restart already tried; bilateral restart is
+				// guarded by a bounded retry counter with exponential backoff so
+				// a single persistently-stuck secondary cannot hold the fleet in
+				// a restart loop forever. The counter is keyed per-pod in the
+				// same sync.Map the reseat tracking uses so the mass-recovery
+				// cleanup loop above also removes it when the pod recovers.
+				if !r.shouldAttemptBilateralRestart(ctx, ag, podName) {
+					continue
+				}
 				log.Info("Secondary persistently NOT SYNCHRONIZING; escalating to bilateral endpoint restart",
 					"pod", podName, "stuckFor", stuckDur.Round(time.Second))
 				if _, epErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword,
@@ -1564,6 +1795,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileNotSynchronizingReplicas
 						log.Error(epErr, "Could not restart HADR endpoint on primary", "pod", ag.Status.PrimaryReplica)
 					}
 				}
+				r.recordBilateralRestart(ag, podName)
 				// Reset timer — next cycle: secondary at 15s, bilateral at 30s
 				r.reseatFirstFailureTime.Store(stuckKey, now)
 			} else if stuckDur >= 15*time.Second {
@@ -1682,69 +1914,166 @@ func (r *SQLServerAvailabilityGroupReconciler) clear41104Tracking(
 	r.reseatFirstFailureTime.Delete(cooldownKey + "/offlineRestart")
 }
 
-// queryAGDatabaseNames returns the database names in the AG as seen from the primary.
-// Returns nil if the query fails (treated as unknown — seeding check is skipped).
-func (r *SQLServerAvailabilityGroupReconciler) queryAGDatabaseNames(
-	ctx context.Context,
-	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
-	exec *sqlutil.Executor,
-	saPassword string,
-) []string {
-	res, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
-		sqlutil.AGDatabaseNamesSQL(ag.Spec.AGName))
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for line := range strings.SplitSeq(res.Stdout, "\n") {
-		name := strings.TrimSpace(line)
-		if name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
+// bilateralAttemptsKey is the sync.Map key used for tracking bilateral HADR
+// endpoint restart attempts against a stuck secondary.
+func bilateralAttemptsKey(ag *sqlv1alpha1.SQLServerAvailabilityGroup, podName string) string {
+	return ag.Namespace + "/" + ag.Name + "/" + podName + "/bilateralAttempts"
 }
 
-// isSeedingInProgress returns true when the secondary pod is missing at least
-// one database that exists in the AG on the primary, indicating that automatic
-// seeding has not yet completed for that database.
+// shouldAttemptBilateralRestart returns true when the operator is permitted to
+// perform another bilateral HADR endpoint restart against podName. It enforces
+// two guards:
 //
-// Automatic seeding creates the database on the secondary only after all pages
-// have been transferred. While seeding is in progress, sys.databases on the
-// secondary does not contain the database being seeded, so it will be absent
-// from the secondary's online user-database list.
+//  1. Attempt cap: after maxBilateralRestarts consecutive attempts without the
+//     replica recovering, further attempts are skipped and a Degraded condition
+//     (ReplicaRecoveryFailed) is surfaced so the incident is visible to the
+//     operator instead of silently looping.
+//  2. Exponential backoff: each attempt must wait base*2^attempts (capped at
+//     bilateralRestartMaxBackoff) after the previous attempt. This caps the
+//     blast radius of repeated bilateral restarts, which cycle the primary
+//     endpoint and briefly disrupt every secondary.
+func (r *SQLServerAvailabilityGroupReconciler) shouldAttemptBilateralRestart(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	podName string,
+) bool {
+	log := logf.FromContext(ctx)
+	key := bilateralAttemptsKey(ag, podName)
+	raw, loaded := r.reseatFirstFailureTime.Load(key)
+	if !loaded {
+		return true
+	}
+	state, ok := raw.(bilateralRestartState)
+	if !ok {
+		// Corrupted value (should never happen) — reset and allow.
+		r.reseatFirstFailureTime.Delete(key)
+		return true
+	}
+	if state.count >= maxBilateralRestarts {
+		// Surface the exhaustion once per operator lifetime via the AG status
+		// so operators can see it in `kubectl describe`. Re-patching on every
+		// reconcile is cheap because the condition type/status are stable.
+		r.patchReplicaRecoveryFailed(ctx, ag, podName, state.count)
+		log.Info("Bilateral restart limit reached; manual intervention required",
+			"pod", podName, "attempts", state.count)
+		return false
+	}
+	// Exponential backoff: base * 2^count, capped.
+	shift := state.count
+	if shift > 30 {
+		shift = 30 // avoid overflow; 2^30 * 30s far exceeds the 10m cap
+	}
+	backoff := bilateralRestartBaseBackoff << shift
+	if backoff > bilateralRestartMaxBackoff || backoff <= 0 {
+		backoff = bilateralRestartMaxBackoff
+	}
+	if time.Since(state.lastAttempt) < backoff {
+		log.Info("Bilateral restart deferred by backoff",
+			"pod", podName, "attempts", state.count, "backoff", backoff.Round(time.Second),
+			"elapsed", time.Since(state.lastAttempt).Round(time.Second))
+		return false
+	}
+	return true
+}
+
+// recordBilateralRestart increments the bilateral restart counter for podName
+// and stamps the current time as the most recent attempt. Called immediately
+// after a bilateral restart is issued so the next check observes the new state.
+func (r *SQLServerAvailabilityGroupReconciler) recordBilateralRestart(
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup, podName string,
+) {
+	key := bilateralAttemptsKey(ag, podName)
+	raw, _ := r.reseatFirstFailureTime.Load(key)
+	state, _ := raw.(bilateralRestartState)
+	state.count++
+	state.lastAttempt = time.Now()
+	r.reseatFirstFailureTime.Store(key, state)
+}
+
+// patchReplicaRecoveryFailed sets a Degraded condition on the AG so operators
+// can see that automatic bilateral-restart recovery has been abandoned for a
+// given replica. Errors are swallowed; the status patch is a best-effort
+// signal and must not block the reconcile loop.
+func (r *SQLServerAvailabilityGroupReconciler) patchReplicaRecoveryFailed(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	podName string,
+	attempts int,
+) {
+	log := logf.FromContext(ctx)
+	patch := client.MergeFrom(ag.DeepCopy())
+	apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+		Type:               "ReplicaRecoveryFailed",
+		Status:             metav1.ConditionTrue,
+		Reason:             "BilateralRestartLimitReached",
+		Message:            fmt.Sprintf("Replica %s remained NOT SYNCHRONIZING after %d bilateral endpoint restarts; manual intervention required", podName, attempts),
+		ObservedGeneration: ag.Generation,
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.Status().Patch(ctx, ag, patch); err != nil {
+		log.Info("Could not patch ReplicaRecoveryFailed condition", "err", err)
+	}
+}
+
+// activeAutomaticSeeding queries sys.dm_hadr_automatic_seeding on the primary
+// to determine whether an automatic seeding operation is currently in-flight
+// toward secondaryPod. Returns the list of "<dbname>|<internal_state_desc>"
+// entries for active seeds (INITIALIZING, WAITING_FOR_DATA, or RUNNING), or
+// nil when no active seeding is observed or the primary is unreachable.
 //
-// Database names are resolved with DB_NAME() on both sides for consistent
-// comparison, avoiding false positives when non-AG user databases exist on
-// a secondary.
-func (r *SQLServerAvailabilityGroupReconciler) isSeedingInProgress(
+// Issuing SET (ROLE = SECONDARY) during an active seed cancels the VDI
+// restore (SQL Server internal reason code 215). Other non-ONLINE transient
+// states on the secondary (RESTORING on SQL restart, brief RECOVERY_PENDING
+// after a pod recreate) are NOT real seeding and do not require blocking the
+// re-seat.
+func (r *SQLServerAvailabilityGroupReconciler) activeAutomaticSeeding(
 	ctx context.Context,
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
 	exec *sqlutil.Executor,
 	saPassword string,
 	secondaryPod string,
-	agDatabaseNames []string,
-) bool {
-	res, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword,
-		sqlutil.SecondaryUserDatabaseNamesSQL())
+) []string {
+	if ag.Status.PrimaryReplica == "" {
+		return nil
+	}
+	res, err := exec.ExecSQL(ctx, ag.Namespace, ag.Status.PrimaryReplica, containerName, saPassword,
+		sqlutil.ActiveAutomaticSeedingSQL(ag.Spec.AGName, secondaryPod))
 	if err != nil {
-		// Cannot connect to secondary; assume seeding is not in progress so
-		// the normal re-seat logic can handle a genuinely stuck replica.
-		return false
+		return nil
 	}
-	secDBs := make(map[string]struct{})
+	var active []string
 	for line := range strings.SplitSeq(res.Stdout, "\n") {
-		name := strings.TrimSpace(line)
-		if name != "" {
-			secDBs[name] = struct{}{}
+		s := strings.TrimSpace(line)
+		if s != "" {
+			active = append(active, s)
 		}
 	}
-	for _, agDB := range agDatabaseNames {
-		if _, exists := secDBs[agDB]; !exists {
-			return true
+	return active
+}
+
+// secondaryDatabaseStates returns a diagnostic snapshot of the user databases
+// on secondaryPod as "<dbname>|<state_desc>|<sync_state>" entries. Used only
+// for logging; returns nil on error so log sites fall back to a bare message.
+func (r *SQLServerAvailabilityGroupReconciler) secondaryDatabaseStates(
+	ctx context.Context,
+	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
+	exec *sqlutil.Executor,
+	saPassword string,
+	secondaryPod string,
+) []string {
+	res, err := exec.ExecSQL(ctx, ag.Namespace, secondaryPod, containerName, saPassword,
+		sqlutil.SecondaryAGDatabaseStatesSQL())
+	if err != nil {
+		return nil
+	}
+	var states []string
+	for line := range strings.SplitSeq(res.Stdout, "\n") {
+		s := strings.TrimSpace(line)
+		if s != "" {
+			states = append(states, s)
 		}
 	}
-	return false
+	return states
 }
 
 // queryNotSynchronizingPods returns the pod names of secondaries with databases
@@ -1805,12 +2134,22 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 	}
 
 	// Pod is K8s-Ready but NOT serving as primary. Check if another pod is.
+	// Track how many peers were actually reachable so we can distinguish
+	// "every pod is unreachable" (transient networking / API blip) from
+	// "pods are reachable and none are PRIMARY" (genuine headless AG).
+	// Without this gate, mass unreachability incorrectly looks like a headless
+	// AG and triggers an unnecessary failover the moment SQL comes back.
+	reachablePeers := 0
 	for i := range ag.Spec.Replicas {
 		candidatePod := podNameForReplica(ag, i)
 		if candidatePod == primaryPodName {
 			continue
 		}
-		role, _ := exec.GetAGRole(ctx, ag.Namespace, candidatePod, containerName, saPassword, ag.Spec.AGName)
+		role, roleErr := exec.GetAGRole(ctx, ag.Namespace, candidatePod, containerName, saPassword, ag.Spec.AGName)
+		if roleErr != nil {
+			continue
+		}
+		reachablePeers++
 		if role == agRolePrimary {
 			log.Info("Correcting stale primary record; another pod is PRIMARY",
 				"old", primaryPodName, "new", candidatePod)
@@ -1823,7 +2162,18 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 		}
 	}
 
-	// No pod is PRIMARY — the AG is headless. Trigger immediate failover.
+	if reachablePeers == 0 {
+		// Every peer's SQL endpoint was unreachable and the recorded primary is
+		// not serving as PRIMARY. This is almost always transient (cluster-wide
+		// API slowdown, operator\u2014SQL network blip) rather than a genuine
+		// headless AG. Skip failover and let the next reconcile re-check once
+		// pods are reachable again.
+		log.Info("All peers unreachable; deferring headless AG decision until pods are reachable",
+			"recordedPrimary", primaryPodName)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// No pod is PRIMARY \u2014 the AG is headless. Trigger immediate failover.
 	log.Info("AG is headless (no primary); triggering immediate failover",
 		"recordedPrimary", primaryPodName)
 
@@ -1844,7 +2194,6 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	log.Info("Headless AG failover succeeded", "newPrimary", targetPod, "formerPrimary", primaryPodName)
 	now := metav1.Now()
 	ag.Status.PrimaryReplica = targetPod
 	ag.Status.PrimaryNotReadySince = nil
@@ -1853,13 +2202,14 @@ func (r *SQLServerAvailabilityGroupReconciler) failoverHeadlessAG(
 		Type:               "Failover",
 		Status:             metav1.ConditionTrue,
 		Reason:             "HeadlessAGFailover",
-		Message:            fmt.Sprintf("Force failover from headless AG: %s → %s", primaryPodName, targetPod),
+		Message:            fmt.Sprintf("Failover from headless AG: %s → %s", primaryPodName, targetPod),
 		ObservedGeneration: ag.Generation,
 		LastTransitionTime: now,
 	})
 	if sErr := r.Status().Patch(ctx, ag, patch); sErr != nil {
 		return ctrl.Result{}, fmt.Errorf("could not update status after headless failover: %w", sErr)
 	}
+	log.Info("Headless AG failover succeeded", "ag", ag.Spec.AGName, "newPrimary", targetPod, "formerPrimary", primaryPodName)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
@@ -2013,7 +2363,39 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
 
-	// Threshold exceeded — select and promote the best synchronous secondary.
+	// Threshold exceeded — before issuing FAILOVER, verify that no other replica
+	// has already taken over (e.g. via preStop on the outgoing primary). preStop
+	// promotes a HEALTHY secondary and then the pod goes NotReady, which trips
+	// this timer; without this guard the operator would race the preStop and
+	// issue a second FAILOVER against a different replica.
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+	for i := range ag.Spec.Replicas {
+		candidatePod := podNameForReplica(ag, i)
+		if candidatePod == primaryPodName {
+			continue
+		}
+		role, roleErr := exec.GetAGRole(ctx, ag.Namespace, candidatePod, containerName, saPassword, ag.Spec.AGName)
+		if roleErr != nil {
+			continue
+		}
+		if role == agRolePrimary {
+			log.Info("Detected preStop-promoted primary; updating status and skipping automatic failover",
+				"newPrimary", candidatePod, "formerPrimary", primaryPodName)
+			ag.Status.PrimaryReplica = candidatePod
+			ag.Status.PrimaryNotReadySince = nil
+			ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
+			if sErr := r.Status().Patch(ctx, ag, patch); sErr != nil {
+				return ctrl.Result{}, fmt.Errorf("could not update status after detecting preStop failover: %w", sErr)
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	// Threshold exceeded and no peer is PRIMARY — select and promote the best synchronous secondary.
 	log.Info("Primary NotReady threshold exceeded; selecting failover target",
 		"pod", primaryPodName, "elapsed", elapsed.Round(time.Second))
 
@@ -2023,11 +2405,6 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	saPassword, err := r.getSAPassword(ctx, ag)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 	foRes, foErr := exec.ExecSQL(ctx, ag.Namespace, targetPod, containerName, saPassword,
 		sqlutil.FailoverSQL(ag.Spec.AGName))
 	if foErr != nil {
@@ -2039,7 +2416,6 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	log.Info("Automatic unplanned failover succeeded", "newPrimary", targetPod, "formerPrimary", primaryPodName)
 	ag.Status.PrimaryReplica = targetPod
 	ag.Status.PrimaryNotReadySince = nil
 	ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
@@ -2054,6 +2430,7 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 	if err := r.Status().Patch(ctx, ag, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not update status after failover: %w", err)
 	}
+	log.Info("Automatic unplanned failover succeeded", "ag", ag.Spec.AGName, "newPrimary", targetPod, "formerPrimary", primaryPodName)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
@@ -2075,9 +2452,13 @@ func (r *SQLServerAvailabilityGroupReconciler) mapPodToAG(ctx context.Context, o
 }
 
 // reconcilePVCReclaimPolicy lists all PVCs for the AG's replicas (matched by the
-// "app: <agName>" label the StatefulSet applies), then patches each bound PV's
-// reclaimPolicy to match spec.storage.reclaimPolicy. Defaults to Retain when the
+// StatefulSet-generated name prefix "mssql-data-<agName>-") then patches each bound
+// PV's reclaimPolicy to match spec.storage.reclaimPolicy. Defaults to Retain when the
 // field is unset so data is never silently deleted on CR removal.
+//
+// Name-based matching is used rather than a label selector because earlier releases
+// built the VolumeClaimTemplate without labels; existing deployments therefore have
+// unlabeled PVCs, and VCTs are immutable on a live StatefulSet.
 func (r *SQLServerAvailabilityGroupReconciler) reconcilePVCReclaimPolicy(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
 	log := logf.FromContext(ctx)
 	desired := ag.Spec.Storage.ReclaimPolicy
@@ -2086,15 +2467,16 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcilePVCReclaimPolicy(ctx con
 	}
 
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, pvcList,
-		client.InNamespace(ag.Namespace),
-		client.MatchingLabels{"app": ag.Name},
-	); err != nil {
+	if err := r.List(ctx, pvcList, client.InNamespace(ag.Namespace)); err != nil {
 		return fmt.Errorf("could not list PVCs: %w", err)
 	}
 
+	namePrefix := "mssql-data-" + ag.Name + "-"
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
+		if !strings.HasPrefix(pvc.Name, namePrefix) {
+			continue
+		}
 		if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName == "" {
 			continue
 		}
@@ -2110,7 +2492,98 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcilePVCReclaimPolicy(ctx con
 		if err := r.Patch(ctx, pv, patch); err != nil {
 			return fmt.Errorf("could not patch PV %s reclaimPolicy: %w", pv.Name, err)
 		}
-		log.Info("Patched PV reclaimPolicy", "pv", pv.Name, "policy", desired)
+		log.Info("Patched PV reclaimPolicy", "ag", ag.Name, "namespace", ag.Namespace, "pv", pv.Name, "policy", desired)
+	}
+	return nil
+}
+
+// certExpiryWarningWindow is the lead time before certificate expiry at which
+// the operator surfaces a CertificateExpiring condition. 90 days gives
+// operators a full quarterly window to schedule a rotation.
+const certExpiryWarningWindow = 90 * 24 * time.Hour
+
+// reconcileCertificateExpiry queries every reachable replica for the expiry
+// date of its AG endpoint certificate and sets a CertificateExpiring condition
+// when the earliest expiry is within certExpiryWarningWindow.
+//
+// This does NOT rotate certificates — rotation requires coordinated peer
+// redistribution and ALTER ENDPOINT AUTHENTICATION changes which are out of
+// scope for this pass. The condition makes expiry visible so operators can
+// plan a rotation before the AG fails silently.
+func (r *SQLServerAvailabilityGroupReconciler) reconcileCertificateExpiry(ctx context.Context, ag *sqlv1alpha1.SQLServerAvailabilityGroup) error {
+	log := logf.FromContext(ctx)
+	saPassword, err := r.getSAPassword(ctx, ag)
+	if err != nil {
+		return err
+	}
+	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
+
+	var earliest time.Time
+	var earliestPod, earliestCert string
+	for i := range ag.Spec.Replicas {
+		podName := podNameForReplica(ag, i)
+		certName := certNameForPod(podName)
+		query := fmt.Sprintf(
+			`SET NOCOUNT ON; SELECT CONVERT(varchar(19), expiry_date, 120) FROM sys.certificates WHERE name = '%s';`,
+			certName,
+		)
+		res, execErr := exec.ExecSQL(ctx, ag.Namespace, podName, containerName, saPassword, query)
+		if execErr != nil {
+			// Pod unreachable or SQL unavailable — skip; next reconcile will retry.
+			continue
+		}
+		out := strings.TrimSpace(res.Stdout)
+		if out == "" {
+			continue
+		}
+		// sqlcmd returns rows line-by-line; take the first non-empty line.
+		line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
+		expiry, parseErr := time.Parse("2006-01-02 15:04:05", line)
+		if parseErr != nil {
+			log.Info("Could not parse cert expiry date", "pod", podName, "raw", line, "err", parseErr)
+			continue
+		}
+		if earliest.IsZero() || expiry.Before(earliest) {
+			earliest = expiry
+			earliestPod = podName
+			earliestCert = certName
+		}
+	}
+
+	if earliest.IsZero() {
+		// No reachable pods returned an expiry — nothing to report this cycle.
+		return nil
+	}
+
+	remaining := time.Until(earliest)
+	patch := client.MergeFrom(ag.DeepCopy())
+	if remaining <= certExpiryWarningWindow {
+		apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+			Type:   "CertificateExpiring",
+			Status: metav1.ConditionTrue,
+			Reason: "CertificateNearingExpiry",
+			Message: fmt.Sprintf(
+				"Endpoint certificate %q on %s expires in %s (%s); schedule a manual rotation",
+				earliestCert, earliestPod, remaining.Round(24*time.Hour), earliest.Format("2006-01-02"),
+			),
+			ObservedGeneration: ag.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+	} else {
+		apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+			Type:   "CertificateExpiring",
+			Status: metav1.ConditionFalse,
+			Reason: "CertificateHealthy",
+			Message: fmt.Sprintf(
+				"Earliest endpoint certificate expires %s (%s remaining)",
+				earliest.Format("2006-01-02"), remaining.Round(24*time.Hour),
+			),
+			ObservedGeneration: ag.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+	}
+	if err := r.Status().Patch(ctx, ag, patch); err != nil {
+		return fmt.Errorf("could not patch CertificateExpiring condition: %w", err)
 	}
 	return nil
 }

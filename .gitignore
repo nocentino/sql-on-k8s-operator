@@ -34,3 +34,4 @@ testing/logs/
 
 # Task notes and plans
 tasks/*
+logs/*

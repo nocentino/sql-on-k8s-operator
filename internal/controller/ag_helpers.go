@@ -67,6 +67,14 @@ func podNameForReplica(ag *sqlv1alpha1.SQLServerAvailabilityGroup, i int) string
 // SQLCMDPASSWORD environment variable (populated from MSSQL_SA_PASSWORD) so
 // the SA password never appears on sqlcmd's command line.
 const preStopScript = `set -o pipefail
+# Defence in depth: $AG_NAME is injected into a T-SQL statement below. The CRD
+# already pattern-validates agName at admission, but if admission is bypassed
+# (e.g. --validate=false) this guard prevents brackets/quotes from escaping the
+# bracket-delimited identifier. Must match quoteBracketIdentifier's safe subset.
+if ! printf %s "$AG_NAME" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+    echo "preStop: invalid AG_NAME value; exiting without failover" >&2
+    exit 0
+fi
 export SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}"
 ROLE=$(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -h -1 -W \
     -Q "SET NOCOUNT ON; SELECT role FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1" \

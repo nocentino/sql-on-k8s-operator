@@ -400,34 +400,47 @@ BEGIN
 END`, escapeSQLString(agName), quotedAG, clusterType, quotedAG)
 }
 
-// AGDatabaseNamesSQL returns a query that lists the database names in the
-// named AG on the local (primary) replica using DB_NAME() for reliable name
-// resolution.
+// ActiveAutomaticSeedingSQL returns T-SQL (run on the primary) that lists the
+// AG databases for which an automatic seeding operation is currently in-flight
+// toward the named secondary replica. Rows are returned as "<dbname>|<state>"
+// where <state> is sys.dm_hadr_automatic_seeding.internal_state_desc
+// (INITIALIZING, WAITING_FOR_DATA, or RUNNING).
 //
-// Used together with SecondaryUserDatabaseNamesSQL to detect automatic seeding
-// in progress: if the secondary is missing a database that exists in the AG on
-// the primary, seeding has not yet completed for that database and
-// SET (ROLE = SECONDARY) must not be issued (it cancels seeding).
-func AGDatabaseNamesSQL(agName string) string {
+// Used to gate SET (ROLE = SECONDARY): issuing that command on a database that
+// is actively being seeded cancels the VDI restore (SQL Server internal reason
+// code 215). Other non-ONLINE transient states on the secondary (RESTORING
+// during SQL startup, brief RECOVERY_PENDING) are not true seeding and do NOT
+// need to block a re-seat.
+func ActiveAutomaticSeedingSQL(agName, secondaryReplicaName string) string {
 	return fmt.Sprintf(`SET NOCOUNT ON;
-SELECT DB_NAME(drs.database_id)
-FROM sys.dm_hadr_database_replica_states drs
-JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
-WHERE ag.name = '%s' AND drs.is_local = 1;`, escapeSQLString(agName))
+SELECT DB_NAME(s.database_id) + '|' + s.internal_state_desc
+FROM sys.dm_hadr_automatic_seeding s
+JOIN sys.availability_replicas ar ON s.replica_id = ar.replica_id
+JOIN sys.availability_groups ag ON ar.group_id = ag.group_id
+WHERE ag.name = '%s'
+  AND ar.replica_server_name = '%s'
+  AND s.completion_time IS NULL
+  AND s.internal_state_desc IN (N'INITIALIZING', N'WAITING_FOR_DATA', N'RUNNING');`,
+		escapeSQLString(agName), escapeSQLString(secondaryReplicaName))
 }
 
-// SecondaryUserDatabaseNamesSQL returns a query that lists the names of online
-// user databases on the local replica using DB_NAME() for reliable name
-// resolution. database_id > 4 excludes the four system databases (master,
-// tempdb, model, msdb).
+// SecondaryAGDatabaseStatesSQL returns T-SQL (run on a secondary) that lists
+// the user databases on the local replica with their database state and AG
+// synchronization state. Rows are returned as
+// "<dbname>|<state_desc>|<sync_state>" where <sync_state> is
+// sys.dm_hadr_database_replica_states.synchronization_state_desc or "NONE"
+// when the database is not attached to an AG locally.
 //
-// Used together with AGDatabaseNamesSQL to detect automatic seeding in progress.
-// A secondary that is missing an AG database has not yet received it via
-// seeding — issuing SET (ROLE = SECONDARY) on such a replica would cancel the
-// in-flight seeding operation (SQL Server internal reason code 215).
-func SecondaryUserDatabaseNamesSQL() string {
+// Used for diagnostic logging so operators can see the actual state of
+// NOT SYNCHRONIZING replicas when the controller issues (or declines to issue)
+// SET (ROLE = SECONDARY). database_id > 4 excludes the four system databases.
+func SecondaryAGDatabaseStatesSQL() string {
 	return `SET NOCOUNT ON;
-SELECT DB_NAME(database_id) FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE';`
+SELECT d.name + '|' + d.state_desc + '|' + ISNULL(drs.synchronization_state_desc, 'NONE')
+FROM sys.databases d
+LEFT JOIN sys.dm_hadr_database_replica_states drs
+    ON drs.database_id = d.database_id AND drs.is_local = 1
+WHERE d.database_id > 4;`
 }
 
 // AGDatabasesSQL returns a query that lists the names of databases in the AG

@@ -227,7 +227,7 @@ SET NOCOUNT ON;
 SELECT rs.role_desc
 FROM sys.availability_groups ag
 JOIN sys.dm_hadr_availability_replica_states rs ON ag.group_id = rs.group_id
-WHERE ag.name = '%s' AND rs.is_local = 1;`, agName)
+WHERE ag.name = '%s' AND rs.is_local = 1;`, escapeSQLString(agName))
 
 	res, err := e.ExecSQL(ctx, namespace, podName, containerName, saPassword, query)
 	if err != nil {
@@ -300,7 +300,7 @@ SET NOCOUNT ON;
 SELECT rs.synchronization_health_desc
 FROM sys.availability_groups ag
 JOIN sys.dm_hadr_availability_replica_states rs ON ag.group_id = rs.group_id
-WHERE ag.name = '%s' AND rs.is_local = 1;`, agName)
+WHERE ag.name = '%s' AND rs.is_local = 1;`, escapeSQLString(agName))
 
 	res, err := e.ExecSQL(ctx, namespace, podName, containerName, saPassword, query)
 	if err != nil {

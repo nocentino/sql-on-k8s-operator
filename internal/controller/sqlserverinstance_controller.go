@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -71,6 +72,13 @@ func (r *SQLServerInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	log.Info("Reconciling SQLServerInstance", "name", instance.Name)
 
+	// --- 0. Pre-flight: verify SA password Secret exists. Without this check a
+	// missing Secret results in a CrashLoopBackOff pod with no operator-level
+	// signal. Instead we set Available=False with a precise reason and requeue.
+	if result, ok, err := r.checkSAPasswordSecret(ctx, instance); !ok {
+		return result, err
+	}
+
 	// --- 1. Reconcile ConfigMap (mssql.conf) ---
 	if err := r.reconcileConfigMap(ctx, instance); err != nil {
 		return ctrl.Result{}, fmt.Errorf("could not reconcile ConfigMap: %w", err)
@@ -117,7 +125,11 @@ func (r *SQLServerInstanceReconciler) reconcileConfigMap(ctx context.Context, in
 		if err := controllerutil.SetControllerReference(instance, newCM, r.Scheme); err != nil {
 			return err
 		}
-		return r.Create(ctx, newCM)
+		if err := r.Create(ctx, newCM); err != nil {
+			return err
+		}
+		logf.FromContext(ctx).Info("Created ConfigMap", "cr", instance.Name, "namespace", instance.Namespace, "name", newCM.Name)
+		return nil
 	}
 	if err != nil {
 		return err
@@ -137,7 +149,11 @@ func (r *SQLServerInstanceReconciler) reconcileStatefulSet(ctx context.Context, 
 		if err2 := controllerutil.SetControllerReference(instance, desired, r.Scheme); err2 != nil {
 			return err2
 		}
-		return r.Create(ctx, desired)
+		if err2 := r.Create(ctx, desired); err2 != nil {
+			return err2
+		}
+		logf.FromContext(ctx).Info("Created StatefulSet", "cr", instance.Name, "namespace", instance.Namespace, "name", desired.Name)
+		return nil
 	}
 	if err != nil {
 		return err
@@ -146,6 +162,13 @@ func (r *SQLServerInstanceReconciler) reconcileStatefulSet(ctx context.Context, 
 	// Reconcile mutable fields from the desired StatefulSet into the live object.
 	// VolumeClaimTemplates and Selector are immutable after creation so they are
 	// intentionally left unchanged.
+	if len(sts.Spec.Template.Spec.Containers) == 0 || len(desired.Spec.Template.Spec.Containers) == 0 {
+		// Defensive: the StatefulSet we own should always have a container, but
+		// an external actor (admin kubectl edit) could remove it. Skip the
+		// mutable-field copy rather than panicking; the next reconcile will
+		// retry once the STS is corrected.
+		return fmt.Errorf("StatefulSet %s has no containers; skipping update", sts.Name)
+	}
 	sts.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
 	sts.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
 	sts.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
@@ -161,43 +184,76 @@ func (r *SQLServerInstanceReconciler) reconcileServices(ctx context.Context, ins
 	// Headless service for StatefulSet stable DNS
 	headless := &corev1.Service{}
 	headlessName := instance.Name + "-headless"
+	desiredHeadless := r.buildHeadlessService(instance)
 	err := r.Get(ctx, types.NamespacedName{Name: headlessName, Namespace: instance.Namespace}, headless)
 	if errors.IsNotFound(err) {
-		svc := r.buildHeadlessService(instance)
-		if err2 := controllerutil.SetControllerReference(instance, svc, r.Scheme); err2 != nil {
+		if err2 := controllerutil.SetControllerReference(instance, desiredHeadless, r.Scheme); err2 != nil {
 			return err2
 		}
-		if err2 := r.Create(ctx, svc); err2 != nil {
+		if err2 := r.Create(ctx, desiredHeadless); err2 != nil {
 			return err2
 		}
+		logf.FromContext(ctx).Info("Created Service", "cr", instance.Name, "namespace", instance.Namespace, "name", desiredHeadless.Name)
 	} else if err != nil {
 		return err
+	} else {
+		// Reconcile ports so Spec.Port changes propagate to the live Service.
+		if !servicePortsEqual(headless.Spec.Ports, desiredHeadless.Spec.Ports) {
+			headless.Spec.Ports = desiredHeadless.Spec.Ports
+			if err2 := r.Update(ctx, headless); err2 != nil {
+				return err2
+			}
+		}
 	}
 
-	// Client-facing service — create if missing, update type if it has drifted.
+	// Client-facing service — create if missing, update type/ports if drifted.
 	clientSvc := &corev1.Service{}
+	desiredClient := r.buildClusterIPService(instance)
 	err = r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, clientSvc)
 	if errors.IsNotFound(err) {
-		svc := r.buildClusterIPService(instance)
-		if err2 := controllerutil.SetControllerReference(instance, svc, r.Scheme); err2 != nil {
+		if err2 := controllerutil.SetControllerReference(instance, desiredClient, r.Scheme); err2 != nil {
 			return err2
 		}
-		return r.Create(ctx, svc)
+		if err2 := r.Create(ctx, desiredClient); err2 != nil {
+			return err2
+		}
+		logf.FromContext(ctx).Info("Created Service", "cr", instance.Name, "namespace", instance.Namespace, "name", desiredClient.Name)
+		return nil
 	}
 	if err != nil {
 		return err
 	}
-	desiredType := instance.Spec.ServiceType
-	if desiredType == "" {
-		desiredType = corev1.ServiceTypeClusterIP
+	changed := false
+	if clientSvc.Spec.Type != desiredClient.Spec.Type {
+		clientSvc.Spec.Type = desiredClient.Spec.Type
+		changed = true
 	}
-	if clientSvc.Spec.Type != desiredType {
-		clientSvc.Spec.Type = desiredType
+	if !servicePortsEqual(clientSvc.Spec.Ports, desiredClient.Spec.Ports) {
+		clientSvc.Spec.Ports = desiredClient.Spec.Ports
+		changed = true
+	}
+	if changed {
 		if err2 := r.Update(ctx, clientSvc); err2 != nil {
 			return err2
 		}
 	}
 	return nil
+}
+
+// servicePortsEqual compares two ServicePort lists by Name, Port, TargetPort,
+// and Protocol. NodePort is intentionally not compared because Kubernetes assigns
+// it when Type=NodePort and comparing would force a needless Update every reconcile.
+func servicePortsEqual(a, b []corev1.ServicePort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Port != b[i].Port ||
+			a[i].TargetPort != b[i].TargetPort || a[i].Protocol != b[i].Protocol {
+			return false
+		}
+	}
+	return true
 }
 
 // updateStatus refreshes the SQLServerInstance status subresource.
@@ -209,27 +265,43 @@ func (r *SQLServerInstanceReconciler) updateStatus(ctx context.Context, instance
 
 	patch := client.MergeFrom(instance.DeepCopy())
 	instance.Status.ReadyReplicas = sts.Status.ReadyReplicas
-	instance.Status.CurrentImage = instance.Spec.Image
+	// Reflect the image the live StatefulSet is actually running rather than the
+	// desired spec so operators can distinguish "rollout pending" from "rollout
+	// complete" by comparing Spec.Image vs Status.CurrentImage.
+	var runningImage string
+	if len(sts.Spec.Template.Spec.Containers) > 0 {
+		runningImage = sts.Spec.Template.Spec.Containers[0].Image
+		instance.Status.CurrentImage = runningImage
+	}
 	instance.Status.ServiceName = instance.Name + "-headless"
 
-	if sts.Status.ReadyReplicas > 0 {
+	switch {
+	case runningImage != "" && runningImage != instance.Spec.Image:
+		// The STS template has been updated but at least one pod still runs the
+		// old image. Mark the instance as Upgrading until the rollout completes.
+		instance.Status.Phase = sqlv1alpha1.PhaseUpgrading
+		setCondition(&instance.Status.Conditions, metav1.Condition{
+			Type:    sqlv1alpha1.ConditionAvailable,
+			Status:  metav1.ConditionFalse,
+			Reason:  "Upgrading",
+			Message: fmt.Sprintf("Rolling from %s to %s", runningImage, instance.Spec.Image),
+		}, instance.Generation)
+	case sts.Status.ReadyReplicas > 0:
 		instance.Status.Phase = sqlv1alpha1.PhaseRunning
 		setCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               sqlv1alpha1.ConditionAvailable,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Running",
-			Message:            "SQL Server is ready",
-			LastTransitionTime: metav1.Now(),
-		})
-	} else {
+			Type:    sqlv1alpha1.ConditionAvailable,
+			Status:  metav1.ConditionTrue,
+			Reason:  "Running",
+			Message: "SQL Server is ready",
+		}, instance.Generation)
+	default:
 		instance.Status.Phase = sqlv1alpha1.PhasePending
 		setCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               sqlv1alpha1.ConditionAvailable,
-			Status:             metav1.ConditionFalse,
-			Reason:             "NotReady",
-			Message:            "Waiting for SQL Server pod to become ready",
-			LastTransitionTime: metav1.Now(),
-		})
+			Type:    sqlv1alpha1.ConditionAvailable,
+			Status:  metav1.ConditionFalse,
+			Reason:  "NotReady",
+			Message: "Waiting for SQL Server pod to become ready",
+		}, instance.Generation)
 	}
 
 	return r.Status().Patch(ctx, instance, patch)
@@ -378,7 +450,7 @@ func (r *SQLServerInstanceReconciler) buildStatefulSet(instance *sqlv1alpha1.SQL
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "mssql-data"},
+					ObjectMeta: metav1.ObjectMeta{Name: "mssql-data", Labels: labels},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes:      accessModes,
 						StorageClassName: instance.Spec.Storage.StorageClassName,
@@ -491,20 +563,88 @@ func buildMSSQLConf(conf map[string]string) string {
 }
 
 // setCondition updates or appends a condition in a condition list.
-func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
-	for i, c := range *conditions {
-		if c.Type == cond.Type {
-			(*conditions)[i] = cond
-			return
+//
+// When an existing condition of the same Type is found:
+//   - Status, Reason, Message, ObservedGeneration are always refreshed.
+//   - LastTransitionTime is preserved unless Status has actually changed.
+//
+// This respects the metav1.Condition contract: LastTransitionTime measures how
+// long the condition has held its current Status, not when it was last patched.
+func setCondition(conditions *[]metav1.Condition, cond metav1.Condition, observedGen int64) {
+	cond.ObservedGeneration = observedGen
+	now := metav1.Now()
+	for i, existing := range *conditions {
+		if existing.Type != cond.Type {
+			continue
 		}
+		if existing.Status == cond.Status {
+			// Status unchanged — preserve the original transition time.
+			cond.LastTransitionTime = existing.LastTransitionTime
+		} else {
+			cond.LastTransitionTime = now
+		}
+		(*conditions)[i] = cond
+		return
+	}
+	// New condition — stamp the current time.
+	if cond.LastTransitionTime.IsZero() {
+		cond.LastTransitionTime = now
 	}
 	*conditions = append(*conditions, cond)
+}
+
+// checkSAPasswordSecret pre-validates the Secret referenced by the spec so a
+// misconfigured instance surfaces as a clear status condition rather than a
+// CrashLoopBackOff pod. Returns (requeueResult, ok, err): when ok is false the
+// caller must return the provided result/err to the reconcile loop.
+func (r *SQLServerInstanceReconciler) checkSAPasswordSecret(ctx context.Context, instance *sqlv1alpha1.SQLServerInstance) (ctrl.Result, bool, error) {
+	ref := instance.Spec.SAPasswordSecretRef
+	secret := &corev1.Secret{}
+	getErr := r.Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: ref.Name}, secret)
+	if getErr != nil {
+		if !errors.IsNotFound(getErr) {
+			return ctrl.Result{}, false, getErr
+		}
+		return r.patchUnavailable(ctx, instance, "SecretNotFound",
+			fmt.Sprintf("Secret %q not found in namespace %q", ref.Name, instance.Namespace))
+	}
+	key := ref.Key
+	if key == "" {
+		key = "SA_PASSWORD"
+	}
+	if _, ok := secret.Data[key]; !ok {
+		return r.patchUnavailable(ctx, instance, "SecretKeyNotFound",
+			fmt.Sprintf("Key %q not found in Secret %q", key, ref.Name))
+	}
+	return ctrl.Result{}, true, nil
+}
+
+// patchUnavailable writes Available=False with the given reason/message and
+// returns a short requeue so the operator retries once the Secret is fixed.
+func (r *SQLServerInstanceReconciler) patchUnavailable(ctx context.Context, instance *sqlv1alpha1.SQLServerInstance, reason, message string) (ctrl.Result, bool, error) {
+	patch := client.MergeFrom(instance.DeepCopy())
+	instance.Status.Phase = sqlv1alpha1.PhasePending
+	setCondition(&instance.Status.Conditions, metav1.Condition{
+		Type:    sqlv1alpha1.ConditionAvailable,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	}, instance.Generation)
+	if err := r.Status().Patch(ctx, instance, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, false, nil
 }
 
 // reconcilePVCReclaimPolicy finds every PVC owned by the instance's StatefulSet and
 // patches the bound PersistentVolume's reclaimPolicy to match spec.storage.reclaimPolicy.
 // This is performed on every reconcile so drift (e.g. a StorageClass default overriding
 // the desired policy) is continuously corrected.
+//
+// PVCs are discovered by StatefulSet-generated name prefix ("mssql-data-<instance>-")
+// rather than by label selector. Earlier releases built the VolumeClaimTemplate without
+// labels, so existing deployments have unlabeled PVCs; name-based matching works for
+// both those and new (labeled) deployments without requiring a breaking STS recreate.
 func (r *SQLServerInstanceReconciler) reconcilePVCReclaimPolicy(ctx context.Context, instance *sqlv1alpha1.SQLServerInstance) error {
 	log := logf.FromContext(ctx)
 	desired := instance.Spec.Storage.ReclaimPolicy
@@ -513,15 +653,16 @@ func (r *SQLServerInstanceReconciler) reconcilePVCReclaimPolicy(ctx context.Cont
 	}
 
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, pvcList,
-		client.InNamespace(instance.Namespace),
-		client.MatchingLabels{"app": instance.Name},
-	); err != nil {
+	if err := r.List(ctx, pvcList, client.InNamespace(instance.Namespace)); err != nil {
 		return fmt.Errorf("could not list PVCs: %w", err)
 	}
 
+	namePrefix := "mssql-data-" + instance.Name + "-"
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
+		if !strings.HasPrefix(pvc.Name, namePrefix) {
+			continue
+		}
 		if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName == "" {
 			continue
 		}
@@ -537,7 +678,7 @@ func (r *SQLServerInstanceReconciler) reconcilePVCReclaimPolicy(ctx context.Cont
 		if err := r.Patch(ctx, pv, patch); err != nil {
 			return fmt.Errorf("could not patch PV %s reclaimPolicy: %w", pv.Name, err)
 		}
-		log.Info("Patched PV reclaimPolicy", "pv", pv.Name, "policy", desired)
+		log.Info("Patched PV reclaimPolicy", "cr", instance.Name, "namespace", instance.Namespace, "pv", pv.Name, "policy", desired)
 	}
 	return nil
 }
