@@ -1115,13 +1115,15 @@ func (r *SQLServerAvailabilityGroupReconciler) getOrCreateMasterKeyPassword(
 		return "", getErr
 	}
 
-	// Generate 32 random bytes → 64-char hex. Hex (not base64) avoids T-SQL
-	// literal escaping concerns because every character is in [0-9a-f].
-	buf := make([]byte, 32)
+	// Generate 30 random bytes → 60-char hex. Prefix with "@Aa0" to
+	// guarantee SQL Server password complexity (symbol, uppercase, lowercase,
+	// digit from four distinct character classes). Hex chars are safe in
+	// T-SQL N'...' string literals with no escaping needed.
+	buf := make([]byte, 30)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("could not generate master key password: %w", err)
 	}
-	pw := hex.EncodeToString(buf)
+	pw := "@Aa0" + hex.EncodeToString(buf)
 
 	newSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

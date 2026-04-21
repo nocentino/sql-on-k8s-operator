@@ -1203,8 +1203,12 @@ rules:
   resources:
   - secrets
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - apps
@@ -1514,7 +1518,10 @@ spec:
         command:
         - /manager
         image: nocentino/sql-on-k8s-operator:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
+        env:
+        - name: ENABLE_WEBHOOKS
+          value: "false"
         livenessProbe:
           httpGet:
             path: /healthz
