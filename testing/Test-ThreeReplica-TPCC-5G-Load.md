@@ -31,7 +31,7 @@ Store all logs and outputs in a structured directory for post-test analysis in .
     - For the hammerdb test, use https://github.com/nocentino/hammerdb and set up the hammerdb.env file properly.
     - On a failover you'll need to restart the hammerdb test since it will disconnect.
     - Also, no rampup time is needed, just start counting right away.
-    - Run the tests for 5 minutes, then perform the failovers. 
+    - Run the tests for 2 minutes, then perform the failovers. 
     - A real DBA wouldn't attempt this failover until the databaes are heathly and synchronized, so we should do the same here. Don't block the tests on time, but replication state, but cap out the test at 60 seconds. if a replica is lost and permanently not healthy, fail the test.
     - **Test A (Planned Rotation)**: Execute a coordinated failover sequence: `0 -> 1`, then `1 -> 2`, then `2 -> 0`. Ensure all replicas return to a `HEALTHY` and `SYNCHRONIZED` synchronization state between each hop. Monitor for any errors.
     - **Test B (Unplanned Failover)**: Simulate a hard failure by `SIGKILL`ing the SQL Server process or deleting the primary Pod 3 consecutive times. Allow the operator to detect the failure and perform an automatic promotion. Wait for the cluster to reach a steady `HEALTHY` state before the next kill.
