@@ -12,6 +12,7 @@ For a detailed introduction to see [Introducing sql-on-k8s-operator](https://www
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Automatic Failover](#automatic-failover)
+- [Admission Webhooks](#admission-webhooks)
 - [API Reference](#api-reference)
 - [Testing Failover](#testing-failover)
 - [Troubleshooting](#troubleshooting)
@@ -49,6 +50,8 @@ The operator provides two custom resources:
 - **Automatic unplanned failover** (when `clusterType: EXTERNAL`) — the operator promotes the best synchronous secondary when the primary pod is continuously unhealthy beyond a configurable threshold, then recovers the restarted replica via bilateral HADR endpoint restarts
 - **Graceful planned failover via preStop hook** — rolling updates and node drains trigger `ALTER AVAILABILITY GROUP FAILOVER` on a synchronized secondary before SIGTERM, converting maintenance into zero-downtime events
 - **Two-tier endpoint restart escalation** — persistent NOT SYNCHRONIZING replicas are recovered with secondary-only restart at 15 s, escalating to bilateral restart (secondary + primary) at 30 s
+- **Bootstrap circuit breaker** — if secondaries repeatedly fail to converge during initial `CREATE AVAILABILITY GROUP`, the operator caps DROP-and-recreate retries at 3 and surfaces a `BootstrapFailed` condition rather than looping indefinitely
+- **Validating admission webhooks** — admission-time rejection of unsupported mutations (rename, `clusterType` switch, edition/storage changes, replica removal) and cross-field invariants the CRD schema can't express (see [Admission Webhooks](#admission-webhooks))
 
 ## Quick Start
 
@@ -58,7 +61,7 @@ The operator provides two custom resources:
 - Docker **17.03+** (or compatible container runtime)
 - kubectl **v1.11.3+**
 - A Kubernetes **v1.11.3+** cluster
-- [cert-manager](https://cert-manager.io/) is **not** required — the operator manages its own certificates
+- The operator manages its own AG endpoint certificates — no cert-manager required for the core install (`dist/install.yaml`). [cert-manager](https://cert-manager.io/) **is** required only if you deploy via `make deploy` with the validating admission webhooks enabled.
 
 ### 1. Deploy the operator
 
@@ -285,6 +288,31 @@ Average wall-clock time from initiation to all replicas HEALTHY + SYNCHRONIZED (
 
 Planned failover completes the role switch in seconds; the bulk of the time is the demoted replica restarting and re-synchronizing. Unplanned failover adds the 30 s `failoverThresholdSeconds` wait plus the 41104 recovery path (ALTER AG OFFLINE + bilateral endpoint restart).
 
+## Admission Webhooks
+
+When deployed via `make deploy` (or any kustomize overlay that includes `config/webhook` and `config/certmanager`), the operator runs a **validating admission webhook** for both CRDs. The webhook rejects mutations that the reconciler cannot safely apply to a live resource and enforces cross-field invariants that the CRD OpenAPI schema cannot express.
+
+**Immutable fields (`SQLServerAvailabilityGroup`):**
+
+| Field | Why it's immutable |
+|---|---|
+| `spec.agName` | Renaming a live AG requires `ALTER AVAILABILITY GROUP MODIFY NAME`, which is not supported by the reconciler |
+| `spec.clusterType` | Switching `NONE`\u2194`EXTERNAL` on a running AG silently breaks failover and listener behaviour |
+| `spec.edition` | A SQL Server edition change requires a full reinstall of the binary |
+| `spec.storage.storageClassName` / `dataVolumeSize` / `accessModes` | PVC recreation is not supported in v1alpha1 |
+
+**Other checks:**
+
+- `spec.agName` must match `^[A-Za-z_][A-Za-z0-9_]*$` (valid SQL identifier).
+- At least one replica is required; **removing** an existing replica is rejected (drop from AG, endpoint grant removal, and PVC cleanup are not automated).
+- `automaticFailover.failoverThresholdSeconds` \u2265 10 when set (prevents spurious failovers from transient probe flaps).
+- `listener.port` must be in 1\u201365535 when specified.
+- `saPasswordSecretRef.name` and `.key` are both required.
+
+`SQLServerInstance` is validated with the same pattern: `edition`, `storage.storageClassName`, `storage.dataVolumeSize`, and `storage.accessModes` are immutable after creation.
+
+Webhook certificates are provisioned by cert-manager (see `config/certmanager/`) and injected into the `ValidatingWebhookConfiguration` via the standard `cert-manager.io/inject-ca-from` annotation. The webhook is not enabled by the bundled `dist/install.yaml`; use the kustomize overlay if you want admission-time validation.
+
 ## API Reference
 
 ### SQLServerInstance spec fields
@@ -345,7 +373,9 @@ Planned failover completes the role switch in seconds; the bulk of the time is t
 | `initializationComplete` | bool | `true` once the AG T-SQL bootstrap has completed |
 | `primaryReplica` | string | Pod name of the current PRIMARY replica |
 | `phase` | string | Overall lifecycle phase |
+| `bootstrapAttempts` | int32 | Number of DROP-and-recreate bootstrap retries; resets to `0` on success and caps at 3 before surfacing `BootstrapFailed` |
 | `replicaStatuses` | []AGReplicaStatus | Per-replica role, synchronization state, and connectivity |
+| `conditions` | []Condition | Includes `BootstrapFailed` when the circuit breaker trips after repeated bootstrap failures |
 
 ## Testing Failover
 
@@ -358,6 +388,12 @@ A quick smoke test using `test-ag-failover.sh`:
 ```
 
 This deploys a three-replica AG, seeds a test database, and exercises both planned and unplanned failover with health checks at every state transition.
+
+Additional helpers under `testing/`:
+
+- `setup-tpcc.sh` — restores the 5 GB `TPCC-5G.bak` from Azure Blob into the current primary, switches the database to FULL recovery, adds it to the AG, and waits for all three replicas to report `SYNCHRONIZED`.
+- `test-d-slow-failover.sh` — drives the slow-failover scenario used to validate the `failoverThresholdSeconds` timer and the NOT SYNCHRONIZING recovery ladder under a non-crash primary degradation.
+- `wait-synchronized.sh` — dynamically discovers the current primary (via `status.primaryReplica`) before polling `sys.dm_hadr_availability_replica_states`, so it keeps working after unplanned failovers rotate the role off `mssql-ag-0`.
 
 ## Troubleshooting
 
