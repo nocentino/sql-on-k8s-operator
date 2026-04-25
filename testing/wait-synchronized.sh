@@ -1,9 +1,20 @@
 #!/bin/bash
 SA="YourStrong!Passw0rd"
 
+# Discover AG pods dynamically so this works for any replica count.
+AG_PODS=()
+while IFS= read -r pod; do
+  [ -n "$pod" ] && AG_PODS+=("$pod")
+done < <(kubectl get pods -l app=mssql-ag \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+REPLICA_COUNT=${#AG_PODS[@]}
+if [ "$REPLICA_COUNT" -eq 0 ]; then
+  echo "ERROR: no pods with label app=mssql-ag found"; exit 1
+fi
+
 # Find the current primary (must query from primary to see all replicas)
 PRIMARY=""
-for pod in mssql-ag-0 mssql-ag-1 mssql-ag-2; do
+for pod in "${AG_PODS[@]}"; do
   role=$(kubectl exec "$pod" -- /opt/mssql-tools18/bin/sqlcmd \
     -S localhost,1433 -U sa -P "$SA" -No -C -h -1 -W \
     -Q "SET NOCOUNT ON; SELECT role_desc FROM sys.dm_hadr_availability_replica_states WHERE is_local=1" \
@@ -11,12 +22,12 @@ for pod in mssql-ag-0 mssql-ag-1 mssql-ag-2; do
   if [ "$role" = "PRIMARY" ]; then PRIMARY="$pod"; break; fi
 done
 if [ -z "$PRIMARY" ]; then
-  echo "WARNING: could not detect primary; falling back to mssql-ag-0"
-  PRIMARY="mssql-ag-0"
+  echo "WARNING: could not detect primary; falling back to ${AG_PODS[0]}"
+  PRIMARY="${AG_PODS[0]}"
 fi
 echo "Querying from primary: $PRIMARY"
 
-echo "Waiting for AG databases SYNCHRONIZED on all 3 replicas..."
+echo "Waiting for AG databases SYNCHRONIZED on all ${REPLICA_COUNT} replicas..."
 for i in $(seq 1 120); do
   result=$(kubectl exec "$PRIMARY" -- /opt/mssql-tools18/bin/sqlcmd \
     -S localhost,1433 -U sa -P "$SA" -No -C -h -1 -W -Q \
@@ -28,9 +39,9 @@ for i in $(seq 1 120); do
 
   not_sync=$(echo "$result" | grep -v "SYNCHRONIZED " | grep mssql-ag | grep -v "^$" | wc -l | tr -d ' ')
   total=$(echo "$result" | grep mssql-ag | wc -l | tr -d ' ')
-  if [ "$total" -ge 3 ] && [ "$not_sync" -eq 0 ]; then
+  if [ "$total" -ge "$REPLICA_COUNT" ] && [ "$not_sync" -eq 0 ]; then
     echo ""
-    echo "ALL 3 replicas SYNCHRONIZED at $((i*5))s"
+    echo "ALL ${REPLICA_COUNT} replicas SYNCHRONIZED at $((i*5))s"
     exit 0
   fi
   sleep 5
