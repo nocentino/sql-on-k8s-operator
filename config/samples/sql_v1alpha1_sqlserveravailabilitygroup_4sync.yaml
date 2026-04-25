@@ -1,0 +1,57 @@
+# SQLServerAvailabilityGroup — 4 synchronous-commit replicas for failover testing
+apiVersion: sql.mssql.microsoft.com/v1alpha1
+kind: SQLServerAvailabilityGroup
+metadata:
+  name: mssql-ag
+  namespace: default
+spec:
+  agName: "AG1"
+  image: mcr.microsoft.com/mssql/server:2025-CU3-ubuntu-22.04
+  edition: Developer
+  acceptEula: "Y"
+  saPasswordSecretRef:
+    name: mssql-ag-secret
+    key: SA_PASSWORD
+  endpointPort: 5022
+  clusterType: EXTERNAL
+  automaticFailover:
+    enabled: true
+    failoverThresholdSeconds: 30
+    healthThreshold: system
+  replicas:
+    - name: primary
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+    - name: secondary-1
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+    - name: secondary-2
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+    - name: secondary-3
+      availabilityMode: SynchronousCommit
+      failoverMode: Automatic
+      readableSecondary: true
+  storage:
+    dataVolumeSize: "20Gi"
+    storageClassName: managed-csi-premium
+    reclaimPolicy: Delete
+  mssqlConf:
+    "sqlagent.enabled": "true"
+  listener:
+    name: mssql-ag-listener
+    port: 1433
+    serviceType: LoadBalancer
+  readOnlyListener:
+    name: mssql-ag-listener-ro
+    port: 1433
+    serviceType: LoadBalancer
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2"
