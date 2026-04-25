@@ -274,6 +274,16 @@ type SQLServerAvailabilityGroupStatus struct {
 	// +optional
 	BootstrapAttempts int32 `json:"bootstrapAttempts,omitempty"`
 
+	// PrimaryDiagsFailures counts consecutive sp_server_diagnostics probes
+	// against the primary that failed (timeout, exec error). After
+	// maxPrimaryDiagsFailures consecutive failures the operator treats the
+	// primary as unhealthy even though the Kubernetes pod is still Ready --
+	// catching "frozen primary" gray failures (SIGSTOP, kernel hang, scheduler
+	// deadlock) where the TCP listener stays open but SQL Server cannot respond.
+	// Reset to 0 on a successful probe.
+	// +optional
+	PrimaryDiagsFailures int32 `json:"primaryDiagsFailures,omitempty"`
+
 	// Conditions represent the current state of the AG.
 	// +listType=map
 	// +listMapKey=type

@@ -298,3 +298,44 @@ Test C checks: (1) primary moved, (2) old primary=SECONDARY, (3) new primary det
 ## L39: Recovery duration in Test C (preStop) is dominated by pod restart, not failover
 **Observation**: Test C durations (99s, 100s, 151s) seem high, but the actual failover completes in <3s (CHECK 3 PASS). The remaining ~90-150s is: pod termination (30s grace period) + pod restart (~30s container pull + SQL startup) + AG re-synchronization of the 6.3GB tpcc database (~30-90s depending on log divergence during the grace period). Round 3 took longer (151s) because the returning pod needed 51s to re-synchronize vs 6s for rounds 1-2, likely due to more accumulated log during the TPC-C workload.
 **Rule**: For preStop-based failovers, the *outage* is <3s (time until new primary serves requests). The *total recovery* (until all replicas are SYNCHRONIZED) depends on database size and log accumulation.
+
+## L40: Frozen-primary gray failure — kubelet readiness probe is not sufficient
+**Mistake**: Assumed the kubelet readiness probe (`/opt/mssql-tools18/bin/sqlcmd -Q "SELECT 1"`) would catch any SQL Server failure that warranted failover. SIGSTOP'd the sqlservr PIDs on the primary; pod stayed `Ready=true` for 175+ seconds with no failover triggered.
+**Root cause**: A frozen process keeps its TCP listener open in the kernel, so the readiness probe's TCP handshake still succeeds. The actual sqlcmd subprocess inside the readiness probe also appears to short-circuit on the local TCP accept before any T-SQL is exchanged. Kubelet sees a healthy pod.
+**Layer 2 (`primaryDiagsUnhealthy` running `sp_server_diagnostics` via kubectl exec) DID timeout — but the operator was treating every exec error as "treat primary as healthy", so the diagnostic channel never triggered failover either.
+**Fix** (v0.44):
+1. Added `Status.PrimaryDiagsFailures` counter on the AG CRD.
+2. `primaryDiagsUnhealthy` now increments the counter on every probe error and resets on success.
+3. After `maxPrimaryDiagsFailures` (=3) consecutive failures, the function returns true (unhealthy), pushing `reconcileFailover` onto the same NotReady-timer path used by Layer 1.
+4. Tightened per-call probe timeout from `DefaultExecTimeout` (30s) to `primaryDiagsTimeout` (5s) so frozen primaries are detected fast instead of holding the reconcile open.
+**Verified**: SIGSTOP'd primary, observed `diagsFails` increment 1→2→3, then `primaryNotReadySince` set, then 30s threshold elapsed, then failover to mssql-ag-1 — total ~5 minutes end-to-end.
+**Rule**: Liveness probes that share infrastructure with the workload (TCP listener bound by the kernel) cannot detect frozen workloads. A persistence-backed consecutive-failure counter on a higher-level probe (sp_server_diagnostics) is the right place to make the unhealthy decision.
+
+## L41: Reconcile cadence determines how fast a counter accumulates
+**Observation**: With 5s diagnostic timeout, expected 3 strikes in ~15s. Actually took ~260s.
+**Root cause**: A single reconcile makes multiple primary-targeted sqlcmd calls (verifyPrimaryRole, NOT SYNCHRONIZING check, RESOLVING recovery check) that still use the default 30s exec timeout. When the primary is frozen, those calls each block for 30s, dragging one reconcile to ~140s. Each reconcile only registers ONE diagnostic strike.
+**Implication**: To bring frozen-primary detection from ~5min to ~65s, ALL primary-targeted sqlcmd calls in the failover path must use a tight (e.g. 5s) timeout, not just the diagnostic one.
+**Rule**: When designing a counter-based detection, account for which slow operations will pace the increments. The slowest call in the loop sets the cadence.
+
+## L42: The old probeScript silently passed against a frozen SQL Server
+**Mistake** (inherited, pre-v0.45): `probeScript = sqlcmd -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`.
+Against a SIGSTOP'd/frozen sqlservr, sqlcmd emits error text like `"Driver 18 ... Timeout error [258]"`, every line of which contains the digit "1". `grep -q "1"` returns 0. kubelet records the probe as successful, pod stays K8s-Ready for the entire freeze. Even without that bug, there's a second latent bug: `sqlcmd | grep` without `set -o pipefail` only surfaces grep's exit code, so sqlcmd's `-b` non-zero exit is masked.
+**Fix** (v0.45):
+- `set -o pipefail` so sqlcmd failures propagate through the pipe.
+- `-l 5 -t 5` cap login and query timeouts so frozen servers fail fast.
+- Sentinel `SELECT 'PROBEOK'` with anchored grep `^PROBEOK$`; no error text can accidentally match.
+- `SET NOCOUNT ON` so "(1 rows affected)" doesn't reach the pipe.
+- `2>/dev/null` so stderr can't pollute the pipe at all.
+**Verified**: SIGSTOP'd primary → pod flips Ready=False in ~45s (PeriodSeconds=15 × FailureThreshold=3), `primaryNotReadySince` timer starts, `failoverThresholdSeconds=30` elapses, failover completes at T+113s. Diag counter stays at 0 — Layer 1 is the driver now.
+**Rule**: Probe scripts must (1) use `set -o pipefail` in shell pipelines, (2) assert positively on a unique sentinel with an anchored regex rather than negatively on "not an error", and (3) pass explicit sqlcmd `-l` and `-t` so network stalls don't exceed the probe's TimeoutSeconds budget.
+
+## L43: STS spec field sync list must include probes
+**Mistake**: The operator's StatefulSet reconciler synced Image/Resources/Env/Ports/Lifecycle/NodeSelector/Tolerations from the desired template into the live object, but NOT LivenessProbe/ReadinessProbe. Changing `probeScript` in the operator source had zero effect on existing AGs — only freshly-created AGs got the new probe. Rolling the operator deployment did not roll SQL Server pods.
+**Fix** (v0.45): add `Containers[0].LivenessProbe` and `ReadinessProbe` to the sync block in reconcileAGStatefulSet. This triggers the StatefulSet controller to do a rolling pod restart when probe definitions change.
+**Rule**: When an operator's reconciler builds a "desired" spec and selectively syncs subfields into the live object (instead of a full spec replace), every field that can legitimately change via an operator upgrade must be in the sync list. Add new fields to the sync list in the same commit that makes them configurable.
+
+## L44: sp_server_diagnostics has a 5s natural cadence; don't time out at 5s
+**Mistake** (v0.44): set `primaryDiagsTimeout = 5*time.Second` believing healthy probes complete in <1s. They don't: `sp_server_diagnostics` with default `@repeat_interval` blocks for ~5s before emitting the first batch even on a perfectly healthy server. A 5s timeout collides with the proc's natural completion time, producing flaky false-positive timeouts that increment the consecutive-failure counter on healthy primaries.
+**Observation**: Persistent `primaryDiagsFailures=2` on a healthy primary with all components reporting state=1 (clean). Different reconciles land on either side of the 5s boundary, leaving the counter bouncing 0→1→2 indefinitely.
+**Fix** (v0.45): `primaryDiagsTimeout = 10*time.Second` — 5s headroom over the proc's natural cadence. Still surfaces a frozen server well inside one reconcile.
+**Rule**: When tightening timeouts on an SQL probe, first confirm the operation's natural floor. For `sp_server_diagnostics`, that floor is the configured `@repeat_interval` (default ≥5s). For generic sqlcmd round-trips against a healthy local server, it's <200ms.

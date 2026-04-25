@@ -524,6 +524,17 @@ spec:
               phase:
                 description: Phase summarizes the overall lifecycle phase.
                 type: string
+              primaryDiagsFailures:
+                description: |-
+                  PrimaryDiagsFailures counts consecutive sp_server_diagnostics probes
+                  against the primary that failed (timeout, exec error). After
+                  maxPrimaryDiagsFailures consecutive failures the operator treats the
+                  primary as unhealthy even though the Kubernetes pod is still Ready --
+                  catching "frozen primary" gray failures (SIGSTOP, kernel hang, scheduler
+                  deadlock) where the TCP listener stays open but SQL Server cannot respond.
+                  Reset to 0 on a successful probe.
+                format: int32
+                type: integer
               primaryNotReadySince:
                 description: |-
                   PrimaryNotReadySince records when the current primary pod first became NotReady.

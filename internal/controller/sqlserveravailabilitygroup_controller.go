@@ -339,6 +339,13 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileAGStatefulSet(ctx contex
 	sts.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
 	sts.Spec.Template.Spec.Containers[0].Ports = desired.Spec.Template.Spec.Containers[0].Ports
 	sts.Spec.Template.Spec.Containers[0].Lifecycle = desired.Spec.Template.Spec.Containers[0].Lifecycle
+	// Probes are synced so operator upgrades that change the probe script or its
+	// tuning (TimeoutSeconds, PeriodSeconds, FailureThreshold) roll out to
+	// existing StatefulSets. Without this, a probe logic fix is only applied to
+	// freshly-created AGs, leaving existing clusters on the old (possibly
+	// broken) probe behavior.
+	sts.Spec.Template.Spec.Containers[0].LivenessProbe = desired.Spec.Template.Spec.Containers[0].LivenessProbe
+	sts.Spec.Template.Spec.Containers[0].ReadinessProbe = desired.Spec.Template.Spec.Containers[0].ReadinessProbe
 	sts.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
 	sts.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
 	return r.Update(ctx, sts)
@@ -914,6 +921,29 @@ func (r *SQLServerAvailabilityGroupReconciler) bootstrapAG(ctx context.Context, 
 // races fail permanently. Three attempts spanning ~105s of exponential
 // backoff (15s, 30s, 60s) is the empirical sweet spot.
 const maxBootstrapAttempts int32 = 3
+
+// maxPrimaryDiagsFailures is the number of consecutive sp_server_diagnostics
+// probe failures (timeouts, exec errors) that must accumulate before the
+// operator declares the primary unhealthy on the diagnostic channel alone.
+// Catches "frozen primary" gray failures (SIGSTOP, kernel hang, non-yielding
+// scheduler) where the pod stays K8s-Ready -- the kernel still answers the
+// readiness probe TCP handshake -- but SQL Server cannot service queries.
+// Three failures across the reconcile cadence is enough to filter transient
+// blips while keeping detection within ~30-40s.
+const maxPrimaryDiagsFailures int32 = 3
+
+// primaryDiagsTimeout caps each individual sp_server_diagnostics probe.
+// The default DefaultExecTimeout (30s) is appropriate for bootstrap DDL but
+// far too long for a liveness check: a frozen primary holds the exec open for
+// the full 30s, dragging out unhealthy detection to several minutes.
+//
+// Floor is set by sp_server_diagnostics itself: the stored procedure blocks
+// for its @repeat_interval (default 5s) before emitting the first row, so a
+// tight 5s budget collides with the proc's natural completion time and
+// produces flaky false-positive timeouts on a perfectly healthy primary.
+// Ten seconds gives 5s headroom over the natural cadence while still
+// surfacing a frozen instance well inside the reconcile cycle.
+const primaryDiagsTimeout = 10 * time.Second
 
 // patchBootstrapFailed surfaces a Degraded/BootstrapFailed condition on the AG
 // after the circuit breaker trips so the situation is visible via kubectl.
@@ -2228,11 +2258,19 @@ func isUnsynchronizedError(res sqlutil.ExecResult, err error) bool {
 
 // primaryDiagsUnhealthy runs sp_server_diagnostics on the named pod and returns true
 // when the instance health fails the configured HealthThreshold. It matches Microsoft's
-// OpenDBWithHealthCheck + Diagnose pattern from mssql-server-ha.
+// OpenDBWithHealthCheck + Diagnose pattern from mssql-server-ha, with one important
+// addition: a frozen primary (SIGSTOP, kernel deadlock, non-yielding scheduler) leaves
+// the pod K8s-Ready but causes every diagnostic probe to time out. Without persistence,
+// each "exec timeout" reconcile would treat the primary as healthy in isolation, and the
+// failure mode would never trigger automatic failover.
 //
-// Returns false (healthy) in all error cases — if SQL Server is genuinely unreachable,
-// the Kubernetes pod readiness probe will catch it and set the pod to NotReady, which
-// is the primary liveness signal for the failover timer.
+// To close that gap the operator counts consecutive probe failures on the AG status
+// (PrimaryDiagsFailures). Once the count crosses maxPrimaryDiagsFailures, the primary
+// is treated as unhealthy and the caller starts the same threshold timer used by the
+// K8s readiness path. A successful probe resets the counter to zero.
+//
+// The probe runs with a tight per-call deadline (primaryDiagsTimeout) so a frozen
+// primary surfaces within seconds rather than the default 30s exec timeout.
 func (r *SQLServerAvailabilityGroupReconciler) primaryDiagsUnhealthy(
 	ctx context.Context,
 	ag *sqlv1alpha1.SQLServerAvailabilityGroup,
@@ -2251,13 +2289,47 @@ func (r *SQLServerAvailabilityGroupReconciler) primaryDiagsUnhealthy(
 		return false
 	}
 
+	// Tight deadline so a frozen primary fails fast instead of holding the
+	// reconcile for the full DefaultExecTimeout. Each consecutive timeout still
+	// counts toward maxPrimaryDiagsFailures.
+	probeCtx, cancel := context.WithTimeout(ctx, primaryDiagsTimeout)
+	defer cancel()
+
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
-	diag, err := exec.CheckServerDiagnostics(ctx, ag.Namespace, podName, containerName, saPassword)
-	if err != nil {
-		// SQL Server temporarily unreachable — treat conservatively as healthy.
-		// The K8s readiness probe will flip the pod to NotReady if it truly fails.
-		log.Info("Could not run sp_server_diagnostics; treating primary as healthy", "pod", podName, "err", err)
+	diag, probeErr := exec.CheckServerDiagnostics(probeCtx, ag.Namespace, podName, containerName, saPassword)
+
+	if probeErr != nil {
+		// Probe failed (timeout or sqlcmd error). Increment the consecutive-failure
+		// counter on status. If this pushes us at or beyond the cap, declare the
+		// primary unhealthy so the caller starts the failover threshold timer.
+		newCount := ag.Status.PrimaryDiagsFailures + 1
+		if newCount > maxPrimaryDiagsFailures {
+			newCount = maxPrimaryDiagsFailures
+		}
+		if newCount != ag.Status.PrimaryDiagsFailures {
+			patch := client.MergeFrom(ag.DeepCopy())
+			ag.Status.PrimaryDiagsFailures = newCount
+			if patchErr := r.Status().Patch(ctx, ag, patch); patchErr != nil {
+				log.Info("Could not persist PrimaryDiagsFailures counter", "err", patchErr)
+			}
+		}
+		if newCount >= maxPrimaryDiagsFailures {
+			log.Info("sp_server_diagnostics has failed for consecutive probes; treating primary as unhealthy",
+				"pod", podName, "consecutiveFailures", newCount, "threshold", maxPrimaryDiagsFailures, "err", probeErr)
+			return true
+		}
+		log.Info("Could not run sp_server_diagnostics; treating primary as healthy",
+			"pod", podName, "consecutiveFailures", newCount, "threshold", maxPrimaryDiagsFailures, "err", probeErr)
 		return false
+	}
+
+	// Probe succeeded. Reset the consecutive-failure counter if it was non-zero.
+	if ag.Status.PrimaryDiagsFailures != 0 {
+		patch := client.MergeFrom(ag.DeepCopy())
+		ag.Status.PrimaryDiagsFailures = 0
+		if patchErr := r.Status().Patch(ctx, ag, patch); patchErr != nil {
+			log.Info("Could not reset PrimaryDiagsFailures counter", "err", patchErr)
+		}
 	}
 
 	healthy := diag.IsHealthyAt(threshold)

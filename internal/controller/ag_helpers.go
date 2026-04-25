@@ -98,7 +98,25 @@ exit 0
 `
 
 // probeScript is the shell one-liner used by both liveness and readiness probes.
-// It connects to the local SQL Server, runs SELECT 1, and exits non-zero on any
-// failure. SQLCMDPASSWORD is sourced from the MSSQL_SA_PASSWORD env var so the
-// password never appears on the sqlcmd command line (visible to ps inside the pod).
-const probeScript = `SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -Q "SELECT 1" -C -b 2>&1 | grep -q "1"`
+// It connects to the local SQL Server, runs a sentinel query, and exits non-zero
+// on any failure. SQLCMDPASSWORD is sourced from the MSSQL_SA_PASSWORD env var so
+// the password never appears on the sqlcmd command line (visible to ps inside the pod).
+//
+// Correctness notes -- earlier versions used `sqlcmd -Q "SELECT 1" 2>&1 | grep -q "1"`
+// which silently passed against a frozen/unreachable SQL Server because:
+//   1. `2>&1` piped sqlcmd's error messages (containing digits like "Driver 18" and
+//      "Timeout error [258]") into grep's input, so `grep -q "1"` always matched.
+//   2. Without `set -o pipefail`, the pipeline's exit status came from grep, not
+//      sqlcmd -- masking sqlcmd's non-zero exit from `-b`.
+//
+// This version fixes both issues:
+//   - `set -o pipefail` surfaces sqlcmd's non-zero exit through the pipe.
+//   - `-l 5 -t 5` cap the login and query timeouts at 5s each so a stalled server
+//     fails within the probe's TimeoutSeconds budget.
+//   - A unique sentinel `PROBEOK` anchored with `^PROBEOK$` cannot be accidentally
+//     matched by any ODBC/sqlcmd error text.
+//   - `SET NOCOUNT ON` suppresses the "(1 rows affected)" line so only the sentinel
+//     reaches grep.
+//   - `2>/dev/null` drops sqlcmd stderr entirely (kubelet captures it from the
+//     container exec anyway) so it can never pollute grep's input.
+const probeScript = `set -o pipefail; SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -l 5 -t 5 -Q "SET NOCOUNT ON; SELECT 'PROBEOK'" 2>/dev/null | grep -q '^PROBEOK$'`
