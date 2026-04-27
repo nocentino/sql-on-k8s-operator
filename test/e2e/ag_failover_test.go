@@ -46,20 +46,6 @@ func failoverToReplica(targetPod, _ string) error {
 	return nil
 }
 
-// forceFailoverToReplica promotes a secondary using FORCE_FAILOVER_ALLOW_DATA_LOSS.
-// Use this only when the current primary is unavailable (unplanned failover or failback
-// after a forced failover already changed the primary).
-// sp_set_session_context is required to authorize the DDL in EXTERNAL mode (Msg 47104).
-func forceFailoverToReplica(targetPod string) error {
-	sql := "EXEC sp_set_session_context @key = N'external_cluster', @value = N'yes';" +
-		" ALTER AVAILABILITY GROUP AG1 FORCE_FAILOVER_ALLOW_DATA_LOSS;"
-	out, err := execSQL(targetPod, sql)
-	if err != nil {
-		return fmt.Errorf("%w — sqlcmd output: %s", err, out)
-	}
-	return nil
-}
-
 var _ = Describe("AG Failover", Ordered, Label("ag", "failover"), func() {
 	var primaryPod string
 	const rowCount = 50

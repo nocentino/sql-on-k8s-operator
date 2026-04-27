@@ -35,6 +35,7 @@ Store all logs and outputs in a structured directory for post-test analysis in .
    - A real DBA wouldn't attempt a failover until the databaes are heathly and synchronized, so we should do the same here. Don't block the tests on time, but replication state, but cap out the test at 60 seconds. if a replica is lost and permanently not healthy, fail the test.
    - **Test A (Planned Rotation)**: Execute a coordinated failover sequence: `0 -> 1`, then `1 -> 2`, then `2 -> 0`. Ensure all replicas return to a `HEALTHY` and `SYNCHRONIZED` synchronization state between each hop. Monitor for any errors. If an error is encountered, fail the test and start troubleshooting.
    - **Test B (Unplanned Failover)**: Simulate a hard failure by `SIGKILL`ing the SQL Server process or deleting the primary Pod 3 consecutive times. Allow the operator to detect the failure and perform an automatic promotion. Wait for all replicas to reach a steady `HEALTHY` state before the next kill. If an error is encountered, fail the test and start troubleshooting.
+   - **Test C (Unplanned Failover)**: Simulate a grey failure by `SIGSTOP`ing the SQL Server process 3 consecutive times. Allow the operator to detect the failure and perform an automatic promotion. Wait for all replicas to reach a steady `HEALTHY` state before the next kill. If an error is encountered, fail the test and start troubleshooting.
 
 5. **Log Collection & Forensic Analysis**:
     - Export the operator controller logs, store them in `./testing/logs/

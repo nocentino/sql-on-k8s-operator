@@ -2256,6 +2256,41 @@ func isUnsynchronizedError(res sqlutil.ExecResult, err error) bool {
 	return sqlutil.HasSQLError(res, err, sqlutil.ErrCodeNotSynchronized)
 }
 
+// evaluatePrimaryDiagsResult is the pure state-transition for primaryDiagsUnhealthy.
+//
+// Inputs:
+//   - currentCount: the current Status.PrimaryDiagsFailures value.
+//   - diag: the diagnostics sample (zero value if probeErr != nil).
+//   - probeErr: non-nil if the probe itself failed (timeout, sqlcmd error).
+//   - threshold: "system", "resource", or "query_processing".
+//
+// Outputs:
+//   - newCount: the counter value that should be persisted.
+//   - unhealthy: whether the caller should treat the primary as unhealthy.
+//
+// Semantics:
+//   - probe error: increment counter (capped at maxPrimaryDiagsFailures). Return
+//     unhealthy=true only once the counter reaches the cap.
+//   - probe success: reset counter to 0. Return unhealthy based on diag.IsHealthyAt.
+//
+// Extracting this logic lets unit tests cover the counter math, cap behavior, and
+// reset-on-success without requiring a live SQL Server or a mock Executor.
+func evaluatePrimaryDiagsResult(
+	currentCount int32,
+	diag sqlutil.ServerDiagnostics,
+	probeErr error,
+	threshold string,
+) (newCount int32, unhealthy bool) {
+	if probeErr != nil {
+		newCount = currentCount + 1
+		if newCount > maxPrimaryDiagsFailures {
+			newCount = maxPrimaryDiagsFailures
+		}
+		return newCount, newCount >= maxPrimaryDiagsFailures
+	}
+	return 0, !diag.IsHealthyAt(threshold)
+}
+
 // primaryDiagsUnhealthy runs sp_server_diagnostics on the named pod and returns true
 // when the instance health fails the configured HealthThreshold. It matches Microsoft's
 // OpenDBWithHealthCheck + Diagnose pattern from mssql-server-ha, with one important
@@ -2298,42 +2333,25 @@ func (r *SQLServerAvailabilityGroupReconciler) primaryDiagsUnhealthy(
 	exec := &sqlutil.Executor{Client: r.KubeClient, RestConfig: r.RestConfig}
 	diag, probeErr := exec.CheckServerDiagnostics(probeCtx, ag.Namespace, podName, containerName, saPassword)
 
-	if probeErr != nil {
-		// Probe failed (timeout or sqlcmd error). Increment the consecutive-failure
-		// counter on status. If this pushes us at or beyond the cap, declare the
-		// primary unhealthy so the caller starts the failover threshold timer.
-		newCount := ag.Status.PrimaryDiagsFailures + 1
-		if newCount > maxPrimaryDiagsFailures {
-			newCount = maxPrimaryDiagsFailures
+	newCount, unhealthy := evaluatePrimaryDiagsResult(ag.Status.PrimaryDiagsFailures, diag, probeErr, threshold)
+
+	// Persist the counter transition if it changed.
+	if newCount != ag.Status.PrimaryDiagsFailures {
+		patch := client.MergeFrom(ag.DeepCopy())
+		ag.Status.PrimaryDiagsFailures = newCount
+		if patchErr := r.Status().Patch(ctx, ag, patch); patchErr != nil {
+			log.Info("Could not persist PrimaryDiagsFailures counter", "err", patchErr)
 		}
-		if newCount != ag.Status.PrimaryDiagsFailures {
-			patch := client.MergeFrom(ag.DeepCopy())
-			ag.Status.PrimaryDiagsFailures = newCount
-			if patchErr := r.Status().Patch(ctx, ag, patch); patchErr != nil {
-				log.Info("Could not persist PrimaryDiagsFailures counter", "err", patchErr)
-			}
-		}
-		if newCount >= maxPrimaryDiagsFailures {
-			log.Info("sp_server_diagnostics has failed for consecutive probes; treating primary as unhealthy",
-				"pod", podName, "consecutiveFailures", newCount, "threshold", maxPrimaryDiagsFailures, "err", probeErr)
-			return true
-		}
+	}
+
+	switch {
+	case probeErr != nil && unhealthy:
+		log.Info("sp_server_diagnostics has failed for consecutive probes; treating primary as unhealthy",
+			"pod", podName, "consecutiveFailures", newCount, "threshold", maxPrimaryDiagsFailures, "err", probeErr)
+	case probeErr != nil:
 		log.Info("Could not run sp_server_diagnostics; treating primary as healthy",
 			"pod", podName, "consecutiveFailures", newCount, "threshold", maxPrimaryDiagsFailures, "err", probeErr)
-		return false
-	}
-
-	// Probe succeeded. Reset the consecutive-failure counter if it was non-zero.
-	if ag.Status.PrimaryDiagsFailures != 0 {
-		patch := client.MergeFrom(ag.DeepCopy())
-		ag.Status.PrimaryDiagsFailures = 0
-		if patchErr := r.Status().Patch(ctx, ag, patch); patchErr != nil {
-			log.Info("Could not reset PrimaryDiagsFailures counter", "err", patchErr)
-		}
-	}
-
-	healthy := diag.IsHealthyAt(threshold)
-	if !healthy {
+	case unhealthy:
 		log.Info("sp_server_diagnostics reports primary unhealthy",
 			"pod", podName,
 			"threshold", threshold,
@@ -2341,7 +2359,7 @@ func (r *SQLServerAvailabilityGroupReconciler) primaryDiagsUnhealthy(
 			"resource", diag.Resource,
 			"queryProcessing", diag.QueryProcessing)
 	}
-	return !healthy
+	return unhealthy
 }
 
 // reconcileFailover detects primary pod failures and automatically promotes a synchronous

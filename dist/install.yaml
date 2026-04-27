@@ -1517,7 +1517,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: nocentino/sql-on-k8s-operator:latest
+        image: nocentino/sql-on-k8s-operator:dev
         imagePullPolicy: Always
         env:
         - name: ENABLE_WEBHOOKS
