@@ -104,10 +104,10 @@ exit 0
 //
 // Correctness notes -- earlier versions used `sqlcmd -Q "SELECT 1" 2>&1 | grep -q "1"`
 // which silently passed against a frozen/unreachable SQL Server because:
-//   1. `2>&1` piped sqlcmd's error messages (containing digits like "Driver 18" and
-//      "Timeout error [258]") into grep's input, so `grep -q "1"` always matched.
-//   2. Without `set -o pipefail`, the pipeline's exit status came from grep, not
-//      sqlcmd -- masking sqlcmd's non-zero exit from `-b`.
+//  1. `2>&1` piped sqlcmd's error messages (containing digits like "Driver 18" and
+//     "Timeout error [258]") into grep's input, so `grep -q "1"` always matched.
+//  2. Without `set -o pipefail`, the pipeline's exit status came from grep, not
+//     sqlcmd -- masking sqlcmd's non-zero exit from `-b`.
 //
 // This version fixes both issues:
 //   - `set -o pipefail` surfaces sqlcmd's non-zero exit through the pipe.
