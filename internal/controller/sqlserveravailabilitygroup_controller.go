@@ -1991,10 +1991,8 @@ func (r *SQLServerAvailabilityGroupReconciler) shouldAttemptBilateralRestart(
 		return false
 	}
 	// Exponential backoff: base * 2^count, capped.
-	shift := state.count
-	if shift > 30 {
-		shift = 30 // avoid overflow; 2^30 * 30s far exceeds the 10m cap
-	}
+	// Cap shift at 30 to avoid overflow; 2^30 * 30s far exceeds the 10m cap.
+	shift := min(state.count, 30)
 	backoff := bilateralRestartBaseBackoff << shift
 	if backoff > bilateralRestartMaxBackoff || backoff <= 0 {
 		backoff = bilateralRestartMaxBackoff
@@ -2282,10 +2280,7 @@ func evaluatePrimaryDiagsResult(
 	threshold string,
 ) (newCount int32, unhealthy bool) {
 	if probeErr != nil {
-		newCount = currentCount + 1
-		if newCount > maxPrimaryDiagsFailures {
-			newCount = maxPrimaryDiagsFailures
-		}
+		newCount = min(currentCount+1, maxPrimaryDiagsFailures)
 		return newCount, newCount >= maxPrimaryDiagsFailures
 	}
 	return 0, !diag.IsHealthyAt(threshold)

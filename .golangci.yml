@@ -24,6 +24,8 @@ linters:
     - unused
     - logcheck
   settings:
+    gocyclo:
+      min-complexity: 35
     custom:
       logcheck:
         type: "module"
