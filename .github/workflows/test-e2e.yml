@@ -29,7 +29,29 @@ jobs:
       - name: Verify kind installation
         run: kind version
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the manager image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: sql-on-k8s-operator:latest
+          push: false
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create Kind cluster
+        run: make setup-test-e2e
+
+      - name: Load manager image into Kind
+        run: kind load docker-image sql-on-k8s-operator:latest --name sql-on-k8s-operator-test-e2e
+
       - name: Running Test e2e
+        env:
+          BUILD_IMAGE_SKIP: "true"
+          KIND_CLUSTER_SKIP: "true"
         run: |
           go mod tidy
           make test-e2e
