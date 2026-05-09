@@ -1,6 +1,21 @@
+---
+applyTo: "**"
+---
 # sql-on-k8s-operator - Project-Specific Copilot Instructions
 
 These instructions are specific to the `sql-on-k8s-operator` project and supplement the default repository-wide Copilot instructions.
+
+## This Project
+
+This is a Kubernetes operator for managing SQL Server resources on Kubernetes.
+
+- **API group/domain**: `sql.mssql.microsoft.com`
+- **Version**: `v1alpha1`
+- **Kinds**:
+  - `SQLServerInstance` — standalone SQL Server instance (StatefulSet + PVC + Services)
+  - `SQLServerAvailabilityGroup` — SQL Server Always On AG across multiple replicas
+- **Webhooks**: Validation-only (no defaulting, no conversion). Both kinds have a `ValidatingWebhook`.
+- **`internal/sqlutil/`**: Shared helpers for SQL Server connectivity (connection strings, query helpers). Prefer this package over inline SQL logic in controllers.
 
 ## Project Structure
 
@@ -10,7 +25,7 @@ cmd/main.go                    Manager entry (registers controllers/webhooks)
 api/<version>/*_types.go       CRD schemas (+kubebuilder markers)
 api/<version>/zz_generated.*   Auto-generated (DO NOT EDIT)
 internal/controller/*          Reconciliation logic
-internal/webhook/*             Validation/defaulting (if present)
+internal/webhook/<version>/*   Validation webhooks
 config/crd/bases/*             Generated CRDs (DO NOT EDIT)
 config/rbac/role.yaml          Generated RBAC (DO NOT EDIT)
 config/samples/*               Example CRs (edit these)
@@ -18,23 +33,6 @@ Makefile                       Build/test/deploy commands
 PROJECT                        Kubebuilder metadata Auto-generated (DO NOT EDIT)
 ```
 
-**Multi-group layout** (for projects with multiple API groups):
-```
-api/<group>/<version>/*_types.go       CRD schemas by group
-internal/controller/<group>/*          Controllers by group
-internal/webhook/<group>/<version>/*   Webhooks by group and version (if present)
-```
-
-Multi-group layout organizes APIs by group name (e.g., `batch`, `apps`). Check the `PROJECT` file for `multigroup: true`.
-
-**To convert to multi-group layout:**
-1. Run: `kubebuilder edit --multigroup=true`
-2. Move APIs: `mkdir -p api/<group> && mv api/<version> api/<group>/`
-3. Move controllers: `mkdir -p internal/controller/<group> && mv internal/controller/*.go internal/controller/<group>/`
-4. Move webhooks (if present): `mkdir -p internal/webhook/<group> && mv internal/webhook/<version> internal/webhook/<group>/`
-5. Update import paths in all files
-6. Fix `path` in `PROJECT` file for each resource
-7. Update test suite CRD paths (add one more `..` to relative paths)
 
 ## Critical Rules
 
@@ -231,7 +229,7 @@ log.Error(err, "Failed to create Pod", "name", name)
 **Reference:** https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines
 
 ### Webhooks
-- **Create all types together**: `--defaulting --programmatic-validation --conversion`
+- **This project uses validation-only webhooks** (`--programmatic-validation`). Do not add defaulting or conversion unless explicitly required.
 - **When`--force`is used**: Backup custom logic first, then restore after scaffolding
 - **For multi-version APIs**: Use hub-and-spoke pattern (`--conversion --spoke v2`)
   - Hub version: Usually oldest stable version (v1)
