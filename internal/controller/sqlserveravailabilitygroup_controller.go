@@ -2497,6 +2497,19 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 	if foErr != nil {
 		if isUnsynchronizedError(foRes, foErr) {
 			log.Info("Failover target not synchronized (error 41142); will retry with another candidate next reconcile", "target", targetPod)
+			if elapsed > threshold+5*time.Minute {
+				apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+					Type:               "FailoverBlocked",
+					Status:             metav1.ConditionTrue,
+					Reason:             "AllCandidatesUnsynchronized",
+					Message:            fmt.Sprintf("Primary has been NotReady for %s but all failover candidates returned error 41142 (not synchronized); manual intervention may be required", elapsed.Round(time.Second)),
+					ObservedGeneration: ag.Generation,
+					LastTransitionTime: now,
+				})
+				if pErr := r.Status().Patch(ctx, ag, patch); pErr != nil {
+					log.Error(pErr, "Could not set FailoverBlocked condition")
+				}
+			}
 		} else {
 			log.Error(foErr, "Failover command failed; will retry", "target", targetPod)
 		}
@@ -2506,6 +2519,14 @@ func (r *SQLServerAvailabilityGroupReconciler) reconcileFailover(ctx context.Con
 	ag.Status.PrimaryReplica = targetPod
 	ag.Status.PrimaryNotReadySince = nil
 	ag.Status.Phase = sqlv1alpha1.AGPhaseRunning
+	apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
+		Type:               "FailoverBlocked",
+		Status:             metav1.ConditionFalse,
+		Reason:             "FailoverSucceeded",
+		Message:            "",
+		ObservedGeneration: ag.Generation,
+		LastTransitionTime: now,
+	})
 	apimeta.SetStatusCondition(&ag.Status.Conditions, metav1.Condition{
 		Type:               "Failover",
 		Status:             metav1.ConditionTrue,

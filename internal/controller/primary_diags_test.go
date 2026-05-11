@@ -24,12 +24,12 @@ import (
 // and (d) treat a successful-but-unhealthy diagnostics response as unhealthy
 // without polluting the counter.
 func TestEvaluatePrimaryDiagsResult(t *testing.T) {
-	// The healthy diagnostic sample all three components report state=1 (clean).
-	healthy := sqlutil.ServerDiagnostics{System: true, Resource: true, QueryProcessing: true}
+	// The healthy diagnostic sample all four components report state=1 (clean).
+	healthy := sqlutil.ServerDiagnostics{System: true, Resource: true, QueryProcessing: true, IOSubsystem: true}
 
 	// A system-level failure — sp_server_diagnostics reports state=3 for the
 	// "system" component. With threshold="system", this must flip unhealthy.
-	systemFailure := sqlutil.ServerDiagnostics{System: false, Resource: true, QueryProcessing: true}
+	systemFailure := sqlutil.ServerDiagnostics{System: false, Resource: true, QueryProcessing: true, IOSubsystem: true}
 
 	probeErr := errors.New("context deadline exceeded")
 
@@ -120,7 +120,7 @@ func TestEvaluatePrimaryDiagsResult(t *testing.T) {
 		{
 			name:          "successful probe with only resource=false is still healthy at threshold=system",
 			currentCount:  0,
-			diag:          sqlutil.ServerDiagnostics{System: true, Resource: false, QueryProcessing: true},
+			diag:          sqlutil.ServerDiagnostics{System: true, Resource: false, QueryProcessing: true, IOSubsystem: true},
 			threshold:     "system",
 			wantNewCount:  0,
 			wantUnhealthy: false,
@@ -128,7 +128,7 @@ func TestEvaluatePrimaryDiagsResult(t *testing.T) {
 		{
 			name:          "successful probe with resource=false is unhealthy at threshold=resource",
 			currentCount:  0,
-			diag:          sqlutil.ServerDiagnostics{System: true, Resource: false, QueryProcessing: true},
+			diag:          sqlutil.ServerDiagnostics{System: true, Resource: false, QueryProcessing: true, IOSubsystem: true},
 			threshold:     "resource",
 			wantNewCount:  0,
 			wantUnhealthy: true,
@@ -181,7 +181,7 @@ func TestEvaluatePrimaryDiagsResult_ConsecutiveFailureSequence(t *testing.T) {
 
 	// A successful probe arrives after the cap: counter must reset to 0 and
 	// unhealthy must flip back to false.
-	healthy := sqlutil.ServerDiagnostics{System: true, Resource: true, QueryProcessing: true}
+	healthy := sqlutil.ServerDiagnostics{System: true, Resource: true, QueryProcessing: true, IOSubsystem: true}
 	newCount, unhealthy := evaluatePrimaryDiagsResult(count, healthy, nil, "system")
 	if newCount != 0 {
 		t.Errorf("recovery: newCount = %d, want 0", newCount)

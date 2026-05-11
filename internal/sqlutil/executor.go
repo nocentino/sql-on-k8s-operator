@@ -125,11 +125,11 @@ func (e *Executor) ExecSQL(ctx context.Context, namespace, podName, containerNam
 
 // ServerDiagnostics holds the per-component health reported by sp_server_diagnostics.
 // A true value means the component is healthy (state != 3/error).
-// Matches the Diagnostics struct in Microsoft's mssql-server-ha mssqlcommon package.
 type ServerDiagnostics struct {
 	System          bool // OS schedulers, CPU, memory allocator
 	Resource        bool // Buffer pool, out-of-memory conditions
 	QueryProcessing bool // Deadlocked workers, long-running queries
+	IOSubsystem     bool // I/O latency, hung writes, storage failures
 }
 
 // IsHealthyAt returns true when the diagnostics pass the given threshold, where threshold
@@ -139,14 +139,17 @@ type ServerDiagnostics struct {
 //   - "system"           → only system errors cause unhealthy (default, least sensitive)
 //   - "resource"         → system or resource errors cause unhealthy
 //   - "query_processing" → system, resource, or query-processing errors cause unhealthy
+//
+// IOSubsystem is always included at every threshold level: a storage failure is always
+// critical regardless of the configured health sensitivity.
 func (d ServerDiagnostics) IsHealthyAt(threshold string) bool {
 	switch threshold {
 	case "query_processing":
-		return d.System && d.Resource && d.QueryProcessing
+		return d.System && d.IOSubsystem && d.Resource && d.QueryProcessing
 	case "resource":
-		return d.System && d.Resource
+		return d.System && d.IOSubsystem && d.Resource
 	default: // "system"
-		return d.System
+		return d.System && d.IOSubsystem
 	}
 }
 
@@ -176,7 +179,7 @@ DECLARE @diag TABLE (
 INSERT INTO @diag EXEC sp_server_diagnostics;
 SELECT component_name + '|' + CAST(state AS NVARCHAR(5))
 FROM   @diag
-WHERE  component_name IN ('system', 'resource', 'query_processing');`
+WHERE  component_name IN ('system', 'resource', 'query_processing', 'io_subsystem');`
 
 	res, err := e.ExecSQL(ctx, namespace, podName, containerName, saPassword, query)
 	if err != nil {
@@ -187,7 +190,7 @@ WHERE  component_name IN ('system', 'resource', 'query_processing');`
 	const stateError = 3
 
 	// All components default to healthy; only flip to false when state = 3.
-	diag := ServerDiagnostics{System: true, Resource: true, QueryProcessing: true}
+	diag := ServerDiagnostics{System: true, Resource: true, QueryProcessing: true, IOSubsystem: true}
 	for line := range strings.SplitSeq(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		parts := strings.SplitN(line, "|", 2)
@@ -206,6 +209,8 @@ WHERE  component_name IN ('system', 'resource', 'query_processing');`
 			diag.Resource = state != stateError
 		case "query_processing":
 			diag.QueryProcessing = state != stateError
+		case "io_subsystem":
+			diag.IOSubsystem = state != stateError
 		}
 	}
 	return diag, nil
